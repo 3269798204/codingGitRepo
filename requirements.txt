@@ -1,0 +1,54 @@
+# 语音识别 Web UI 系统 - Python 依赖
+
+# Web UI
+streamlit==1.31.0
+streamlit-aggrid==0.3.4.post3  # 高级表格组件
+plotly==5.18.0  # 图表可视化
+
+# Backend API
+fastapi==0.109.0
+uvicorn==0.27.0
+python-multipart==0.0.6  # 文件上传支持
+
+# ASR
+faster-whisper>=1.0.0  # 使用最新版，兼容 FFmpeg 8.x
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# LLM
+openai==1.12.0
+
+# Database
+sqlalchemy==2.0.25
+pymysql==1.1.0
+cryptography==42.0.0  # MySQL 加密支持
+
+# Data Processing
+pandas==2.2.0
+openpyxl==3.1.2  # Excel 支持
+xlrd==2.0.1  # 旧版 Excel 支持
+
+# Async & Concurrency
+celery==5.3.6
+redis==5.0.1  # Celery 消息队列（可选）
+# concurrent-futures 已内置于 Python 3.2+
+
+# Utilities
+python-dotenv==1.0.0  # 环境变量管理
+pydantic==2.6.0  # 数据验证
+uuid6==2024.1.12  # UUID 生成
+tqdm==4.66.1  # 进度条
+
+# Logging
+loguru==0.7.2  # 现代化日志
+
+# File Handling
+requests==2.31.0  # HTTP 下载
+aiohttp==3.9.3  # 异步 HTTP
+
+# Text Processing
+jieba==0.42.1  # 中文分词（用于文本分析）
+regex==2023.12.25
+
+# Monitoring
+psutil==5.9.8  # 系统监控（CPU/GPU/内存）
