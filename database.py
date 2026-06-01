@@ -91,6 +91,7 @@ class AudioResult(Base):
     
     # 元数据
     extra_data = Column(JSON)
+    origin_data_json = Column(JSON)  # 原始输入数据（单个音频：URL；Excel导入：原始JSON）
     error_message = Column(Text)
     
     created_at = Column(DateTime, default=datetime.now)
@@ -110,6 +111,7 @@ class AudioResult(Base):
             'has_abusive_language': self.has_abusive_language,
             'abusive_words': json.loads(self.abusive_words_json) if self.abusive_words_json else [],
             'processing_time': self.processing_time,
+            'origin_data': json.loads(self.origin_data_json) if self.origin_data_json else None,
             'error_message': self.error_message,
         }
 
@@ -156,6 +158,48 @@ class Checkpoint(Base):
     task_id = Column(String(64), ForeignKey('batch_tasks.task_id', ondelete='CASCADE'), nullable=False, index=True)
     checkpoint_key = Column(String(128), nullable=False)
     checkpoint_data = Column(JSON)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class SystemConfig(Base):
+    """系统配置表"""
+    __tablename__ = 'system_configs'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    config_key = Column(String(128), unique=True, nullable=False, index=True)
+    config_value = Column(Text, nullable=False)
+    config_type = Column(Enum('string', 'int', 'float', 'bool', 'json'), default='string')
+    description = Column(String(512))
+    category = Column(String(64), index=True)
+    is_editable = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class User(Base):
+    """用户表"""
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(64), unique=True, nullable=False, index=True)
+    password_hash = Column(String(128), nullable=False)
+    salt = Column(String(128), nullable=False)
+    role = Column(String(32), default='user')
+    email = Column(String(128))
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class Role(Base):
+    """角色表"""
+    __tablename__ = 'roles'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    role_name = Column(String(32), unique=True, nullable=False, index=True)
+    permissions_json = Column(JSON)  # 权限列表
+    description = Column(String(512))
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -273,6 +317,7 @@ class DatabaseManager:
                 llm_time=result_dict.get('llm_time'),
                 realtime_factor=result_dict.get('realtime_factor'),
                 extra_data=json.dumps(result_dict.get('extra_data', {}), ensure_ascii=False) if result_dict.get('extra_data') else None,
+                origin_data_json=json.dumps(result_dict.get('origin_data'), ensure_ascii=False) if result_dict.get('origin_data') else None,
                 error_message=result_dict.get('error_message')
             )
             session.add(audio_result)
@@ -291,6 +336,22 @@ class DatabaseManager:
                 query = query.filter_by(status=status)
             results = query.order_by(AudioResult.created_at.desc()).limit(limit).all()
             return [r.to_dict() for r in results]
+    
+    def get_task_with_results(self, task_id: str) -> Optional[Dict]:
+        """获取任务及其所有结果（用于详情展示）"""
+        with self.get_session() as session:
+            # 获取任务信息
+            task = session.query(BatchTask).filter_by(task_id=task_id).first()
+            if not task:
+                return None
+            
+            # 获取所有结果
+            results = session.query(AudioResult).filter_by(task_id=task_id).all()
+            
+            task_dict = task.to_dict()
+            task_dict['results'] = [r.to_dict() for r in results]
+            
+            return task_dict
     
     # ==================== 日志管理 ====================
     
@@ -396,6 +457,159 @@ class DatabaseManager:
             if report and report.data_json:
                 return json.loads(report.data_json)
             return None
+    
+    # ==================== 系统配置管理 ====================
+    
+    def get_config(self, key: str, default=None):
+        """获取配置值"""
+        with self.get_session() as session:
+            config = session.query(SystemConfig).filter_by(config_key=key).first()
+            if config:
+                # 根据类型转换值
+                if config.config_type == 'int':
+                    return int(config.config_value)
+                elif config.config_type == 'float':
+                    return float(config.config_value)
+                elif config.config_type == 'bool':
+                    return config.config_value.lower() in ('true', '1', 'yes')
+                elif config.config_type == 'json':
+                    return json.loads(config.config_value)
+                else:
+                    return config.config_value
+            return default
+    
+    def set_config(self, key: str, value, config_type: str = 'string', 
+                   description: str = None, category: str = None, is_editable: bool = True):
+        """设置配置值"""
+        with self.get_session() as session:
+            config = session.query(SystemConfig).filter_by(config_key=key).first()
+            
+            # 转换值为字符串存储
+            if config_type == 'json':
+                value_str = json.dumps(value, ensure_ascii=False)
+            else:
+                value_str = str(value)
+            
+            if config:
+                config.config_value = value_str
+                if description:
+                    config.description = description
+                if category:
+                    config.category = category
+            else:
+                config = SystemConfig(
+                    config_key=key,
+                    config_value=value_str,
+                    config_type=config_type,
+                    description=description,
+                    category=category,
+                    is_editable=is_editable
+                )
+                session.add(config)
+    
+    def list_configs(self, category: str = None) -> List[Dict]:
+        """列出配置"""
+        with self.get_session() as session:
+            query = session.query(SystemConfig)
+            if category:
+                query = query.filter_by(category=category)
+            configs = query.order_by(SystemConfig.category, SystemConfig.config_key).all()
+            
+            result = []
+            for config in configs:
+                result.append({
+                    'id': config.id,
+                    'config_key': config.config_key,
+                    'config_value': config.config_value,
+                    'config_type': config.config_type,
+                    'description': config.description,
+                    'category': config.category,
+                    'is_editable': config.is_editable,
+                    'updated_at': config.updated_at.isoformat() if config.updated_at else None
+                })
+            return result
+    
+    def delete_config(self, key: str):
+        """删除配置"""
+        with self.get_session() as session:
+            config = session.query(SystemConfig).filter_by(config_key=key).first()
+            if config:
+                session.delete(config)
+    
+    # ==================== 用户管理 ====================
+    
+    def create_user(self, username: str, password_hash: str, salt: str, 
+                    role: str = 'user', email: str = None) -> bool:
+        """创建用户"""
+        try:
+            with self.get_session() as session:
+                user = User(
+                    username=username,
+                    password_hash=password_hash,
+                    salt=salt,
+                    role=role,
+                    email=email
+                )
+                session.add(user)
+            return True
+        except Exception as e:
+            print(f"❌ 创建用户失败: {e}")
+            return False
+    
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """根据用户名获取用户"""
+        with self.get_session() as session:
+            user = session.query(User).filter_by(username=username).first()
+            if user:
+                return {
+                    'id': user.id,
+                    'username': user.username,
+                    'password_hash': user.password_hash,
+                    'salt': user.salt,
+                    'role': user.role,
+                    'email': user.email,
+                    'is_active': user.is_active
+                }
+            return None
+    
+    def list_users(self) -> List[Dict]:
+        """列出所有用户"""
+        with self.get_session() as session:
+            users = session.query(User).all()
+            return [{
+                'id': u.id,
+                'username': u.username,
+                'role': u.role,
+                'email': u.email,
+                'is_active': u.is_active,
+                'created_at': u.created_at.isoformat() if u.created_at else None
+            } for u in users]
+    
+    def update_user_role(self, username: str, new_role: str) -> bool:
+        """更新用户角色"""
+        try:
+            with self.get_session() as session:
+                user = session.query(User).filter_by(username=username).first()
+                if user:
+                    user.role = new_role
+                    return True
+            return False
+        except Exception as e:
+            print(f"❌ 更新用户角色失败: {e}")
+            return False
+    
+    def delete_user(self, username: str) -> bool:
+        """删除用户"""
+        try:
+            with self.get_session() as session:
+                user = session.query(User).filter_by(username=username).first()
+                if user:
+                    session.delete(user)
+                    return True
+            return False
+        except Exception as e:
+            print(f"❌ 删除用户失败: {e}")
+            return False
 
 
 # 全局数据库实例
@@ -406,3 +620,5 @@ if __name__ == "__main__":
     # 测试
     print("数据库初始化成功")
     print(f"数据库 URL: {config.database.url}")
+
+    db_manager.get_user_by_username("admin");

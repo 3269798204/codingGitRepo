@@ -1,10 +1,65 @@
 """
 登录页面组件
-Streamlit 登录界面
+Streamlit 登录界面 - 支持localStorage持久化和API调用
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
+from api_client import APIClient
 from auth import auth_manager
+
+# 初始化API客户端
+api_client = APIClient(base_url="http://localhost:8000")
+
+
+def save_auth_to_localstorage(token: str, username: str, role: str):
+    """保存认证信息到浏览器localStorage（持久化）"""
+    js = f"""
+    <script>
+    localStorage.setItem('auth_token', '{token}');
+    localStorage.setItem('username', '{username}');
+    localStorage.setItem('user_role', '{role}');
+    localStorage.setItem('logged_in', 'true');
+    </script>
+    """
+    components.html(js, height=0)
+
+
+def clear_auth_from_localstorage():
+    """从浏览器localStorage清除认证信息"""
+    js = """
+    <script>
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('username');
+    localStorage.removeItem('user_role');
+    localStorage.removeItem('logged_in');
+    </script>
+    """
+    components.html(js, height=0)
+
+
+def restore_auth_from_localstorage():
+    """从浏览器localStorage恢复认证信息并返回payload"""
+    return components.html(
+        """
+        <script>
+        const token = localStorage.getItem('auth_token');
+        const username = localStorage.getItem('username');
+        const role = localStorage.getItem('user_role');
+        const loggedIn = localStorage.getItem('logged_in') === 'true';
+
+        const payload = (loggedIn && token && username && role)
+          ? {token, username, role}
+          : null;
+
+        window.parent.postMessage({
+          type: 'streamlit:setComponentValue',
+          value: payload
+        }, '*');
+        </script>
+        """,
+        height=0
+    )
 
 
 def show_login_page():
@@ -41,21 +96,36 @@ def show_login_page():
                 st.error("❌ 请输入用户名和密码")
             else:
                 with st.spinner("正在登录..."):
-                    session_token = auth_manager.login(username, password)
-                    
-                    if session_token:
-                        st.session_state['logged_in'] = True
-                        st.session_state['session_token'] = session_token
+                    try:
+                        # 调用后端API登录
+                        result = api_client.login(username, password)
                         
-                        # 获取用户信息
-                        user_info = auth_manager.verify_session(session_token)
-                        st.session_state['username'] = user_info['username']
-                        st.session_state['user_role'] = user_info['role']
+                        token = result['token']
+                        username = result['username']
+                        role = result['role']
+                        
+                        # 设置API客户端token
+                        api_client.set_auth_token(token)
+                        
+                        # 保存到session_state
+                        st.session_state['logged_in'] = True
+                        st.session_state['session_token'] = token
+                        st.session_state['username'] = username
+                        st.session_state['user_role'] = role
+                        # 保存到URL参数，支持刷新恢复
+                        st.query_params = {
+                            "auth_token": token,
+                            "username": username,
+                            "user_role": role
+                        }
+                        
+                        # 保存到localStorage（持久化）
+                        save_auth_to_localstorage(token, username, role)
                         
                         st.success("✅ 登录成功！")
                         st.rerun()
-                    else:
-                        st.error("❌ 用户名或密码错误")
+                    except Exception as e:
+                        st.error(f"❌ 登录失败: {str(e)}")
         
         if register_button:
             st.session_state['show_register'] = True
@@ -102,41 +172,71 @@ def show_login_page():
 
 def require_auth():
     """
-    认证装饰器
+    认证检查
     检查用户是否已登录，未登录则显示登录页面
+    
+    优化策略：
+    1. 先检查session_state
+    2. 如果session_state没有，尝试从localStorage恢复
+    3. 恢复成功后调用API验证token
+    4. 验证通过则设置session_state
     """
-    if 'logged_in' not in st.session_state or not st.session_state['logged_in']:
-        show_login_page()
-        return False
-    
-    # 验证会话是否有效
-    session_token = st.session_state.get('session_token')
-    if not session_token:
-        st.session_state['logged_in'] = False
-        show_login_page()
-        return False
-    
-    user_info = auth_manager.verify_session(session_token)
-    if not user_info:
-        st.session_state['logged_in'] = False
-        st.session_state.pop('session_token', None)
-        show_login_page()
-        return False
-    
-    return True
+
+    # 1. 快速路径：session_state中已有登录信息即可直接通过
+    if (st.session_state.get('logged_in') and
+        st.session_state.get('username') and
+        st.session_state.get('user_role')):
+        # 确保API客户端持有token（如果有）
+        if st.session_state.get('session_token'):
+            api_client.set_auth_token(st.session_state['session_token'])
+        return True
+
+    # 2. 尝试从URL参数恢复（刷新后）
+    q = st.query_params
+    token = q.get("auth_token")
+    username = q.get("username")
+    role = q.get("user_role")
+    if token and username and role:
+        st.session_state['logged_in'] = True
+        st.session_state['session_token'] = token
+        st.session_state['username'] = username
+        st.session_state['user_role'] = role
+        api_client.set_auth_token(token)
+        return True
+
+    # 3. 尝试从localStorage恢复（刷新后）
+    payload = restore_auth_from_localstorage()
+    if isinstance(payload, dict) and payload:
+        st.session_state['logged_in'] = True
+        st.session_state['session_token'] = payload.get('token')
+        st.session_state['username'] = payload.get('username')
+        st.session_state['user_role'] = payload.get('role')
+        if payload.get('token'):
+            api_client.set_auth_token(payload['token'])
+        return True
+
+    # 4. 未登录则直接显示登录页
+    show_login_page()
+    return False
 
 
 def show_logout_button():
     """显示登出按钮"""
     if st.sidebar.button("🚪 登出"):
-        session_token = st.session_state.get('session_token')
-        if session_token:
-            auth_manager.logout(session_token)
+        # 清除API客户端token
+        api_client.clear_auth_token()
         
+        # 清除localStorage
+        clear_auth_from_localstorage()
+        
+        # 清除session_state
         st.session_state['logged_in'] = False
         st.session_state.pop('session_token', None)
         st.session_state.pop('username', None)
         st.session_state.pop('user_role', None)
+        st.session_state.pop('auth_restored', None)
+        st.session_state.pop('restored_token', None)
+        
         st.rerun()
 
 

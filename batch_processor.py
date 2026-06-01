@@ -14,6 +14,7 @@ from config import config, BatchConfig
 from database import db_manager
 from asr_engine import get_asr_engine
 from csv_parser import CSVParser
+from middleware.idempotency import idempotency_manager
 
 
 class BatchProcessor:
@@ -54,6 +55,17 @@ class BatchProcessor:
         Returns:
             str: 任务 ID
         """
+        # 后端幂等性检查 - 基于任务名称和音频URL生成唯一token
+        request_data = {
+            'task_name': task_name,
+            'audio_urls': sorted(audio_urls),  # 排序以确保相同请求生成相同token
+            'extra_data_count': len(extra_data_list) if extra_data_list else 0
+        }
+        token = idempotency_manager.generate_token(request_data)
+        
+        if not idempotency_manager.check_and_set(token):
+            raise ValueError("⚠️ 相同的批处理请求正在处理中，请勿重复提交！")
+        
         task_id = str(uuid.uuid4())
         total_count = len(audio_urls)
         
@@ -297,7 +309,13 @@ class BatchProcessor:
             'asr_time': result.get('asr_time'),
             'llm_time': result.get('llm_time'),
             'realtime_factor': result.get('realtime_factor'),
-            'extra_data': extra_data
+            'extra_data': extra_data,
+            # 记录原始输入数据
+            'origin_data': {
+                'type': 'single_audio' if not extra_data else 'excel_import',
+                'audio_url': audio_url,
+                'excel_data': extra_data if extra_data else None
+            }
         }
         
         # 保存到数据库

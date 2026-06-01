@@ -31,6 +31,9 @@ class ASRConfig:
     model_size: str = "small"  # tiny, base, small, medium, large
     language: str = "zh"
     
+    # 设备配置
+    device: str = "cpu"  # cpu 或 cuda
+    
     # 解码参数
     beam_size: int = 3
     temperature: float = 0.0

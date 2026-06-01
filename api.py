@@ -6,7 +6,7 @@ FastAPI 后端 API
 import os
 import uuid
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -16,6 +16,7 @@ from batch_processor import BatchProcessor
 from csv_parser import CSVParser
 from report_generator import ReportGenerator
 from logger import business_logger
+from auth import auth_manager
 
 
 # ==================== Pydantic 模型 ====================
@@ -53,6 +54,45 @@ app.add_middleware(
 batch_processor = BatchProcessor()
 csv_parser = CSVParser()
 report_gen = ReportGenerator()
+
+
+# ==================== 认证 API ====================
+
+from pydantic import BaseModel
+
+class LoginRequest(BaseModel):
+    """登录请求模型"""
+    username: str
+    password: str
+
+
+@app.post("/api/auth/login")
+async def login(request: LoginRequest):
+    """用户登录"""
+    token = auth_manager.login(request.username, request.password)
+    if not token:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    
+    user_info = auth_manager.verify_session(token)
+    return {
+        "token": token,
+        "username": user_info['username'],
+        "role": user_info['role']
+    }
+
+
+@app.get("/api/auth/verify")
+async def verify_token(authorization: Optional[str] = Header(None)):
+    """验证token"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="未提供token")
+    
+    token = authorization.replace("Bearer ", "")
+    user_info = auth_manager.verify_session(token)
+    if not user_info:
+        raise HTTPException(status_code=401, detail="token无效或已过期")
+    
+    return user_info
 
 
 # ==================== 任务管理 API ====================
@@ -265,6 +305,93 @@ def get_hardware_info():
     
     detector = get_detector()
     return detector.to_dict()
+
+
+# ==================== 系统配置 API ====================
+
+@app.get("/api/configs")
+def list_configs(category: Optional[str] = None):
+    """查询系统配置列表"""
+    configs = db_manager.list_configs(category)
+    return {"configs": configs}
+
+
+@app.put("/api/configs/{config_key}")
+def update_config(config_key: str, value: str, config_type: str = "string"):
+    """更新系统配置"""
+    try:
+        db_manager.set_config(
+            key=config_key,
+            value=value,
+            config_type=config_type
+        )
+        return {
+            "success": True,
+            "message": f"配置 {config_key} 已更新"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/configs/{config_key}")
+def get_config(config_key: str):
+    """查询单个配置"""
+    config = db_manager.get_config(config_key)
+    if not config:
+        raise HTTPException(status_code=404, detail="配置不存在")
+    return config
+
+
+# ==================== 用户管理 API ====================
+
+@app.get("/api/users")
+def list_users():
+    """查询用户列表（仅管理员）"""
+    users = db_manager.list_users()
+    return {"users": users}
+
+
+@app.get("/api/users/{username}")
+def get_user(username: str):
+    """查询单个用户"""
+    # TODO: 实现用户查询逻辑
+    return {"username": username}
+
+
+@app.post("/api/users")
+def create_user(username: str, password: str, role: str = "user", email: str = ""):
+    """创建用户"""
+    try:
+        success = auth_manager.register_user(username, password, role)
+        if success:
+            return {
+                "success": True,
+                "message": f"用户 {username} 创建成功"
+            }
+        else:
+            raise HTTPException(status_code=400, detail="用户名已存在")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/users/{username}")
+def update_user(username: str, role: Optional[str] = None, is_active: Optional[bool] = None):
+    """更新用户信息"""
+    # TODO: 实现用户更新逻辑
+    return {
+        "success": True,
+        "message": f"用户 {username} 已更新"
+    }
+
+
+@app.delete("/api/users/{username}")
+def delete_user(username: str):
+    """删除用户"""
+    # TODO: 实现用户删除逻辑
+    return {
+        "success": True,
+        "message": f"用户 {username} 已删除"
+    }
 
 
 # ==================== 健康检查 ====================

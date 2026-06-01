@@ -23,6 +23,7 @@ import openai
 import torch
 
 from config import config, ASRConfig
+from model_loader import model_loader
 
 
 class ASREngine:
@@ -45,76 +46,30 @@ class ASREngine:
         self._llm_client = None
         self._initialized = True
         
-        # 加载模型（带超时控制）
-        self._load_model_with_timeout()
+        # 使用模型加载器获取已预加载的模型
+        self._load_model_from_loader()
 
 
-    def _check_model_cache(self, model_size: str) -> bool:
-        """检查模型是否已缓存"""
-        from pathlib import Path
-        home = Path.home()
-        
-        cache_dirs = [
-            home / ".cache" / "huggingface" / "hub",
-            home / ".cache" / "torch" / "hub",
-        ]
-        
-        for cache_dir in cache_dirs:
-            if cache_dir.exists():
-                model_pattern = f"*whisper-{model_size}*"
-                matches = list(cache_dir.glob(model_pattern))
-                if matches:
-                    print(f"✓ 发现缓存模型：{matches[0]}")
-                    return True
-        
-        print(f"⚠️ 未找到缓存模型，可能需要下载（首次运行会较慢）")
-        return False
-
-
-    def _load_model_with_timeout(self):
-        """带超时控制的模型加载"""
-        detector_type = self._detect_device()
-        device = detector_type['device']
-        compute_type = detector_type['compute_type']
-        
-        model_size = self.config.model_size or 'small'
-        timeout = self.config.model_load_timeout or 120
-        
-        print("\n" + "="*60)
-        print("正在加载 Faster-Whisper 模型...")
-        print(f"设备: {device}, 计算类型: {compute_type}, 模型: {model_size}")
-        print("="*60)
-        # todo 校验模型缓存是否存在
-        self._check_model_cache(model_size)
-        
-        def _load_model():
-            start_time = time.time()
-            
-            # ⚡ 优化：根据 CPU 核心数动态调整线程数
-            cpu_count = multiprocessing.cpu_count()
-            optimal_threads = min(12, max(4, cpu_count))
-            
-            model = WhisperModel(
-                model_size,
-                device=device,
-                compute_type=compute_type,
-                cpu_threads=optimal_threads,
-                num_workers=2
-            )
-            elapsed = time.time() - start_time
-            print(f"✓ 模型加载完成（耗时: {elapsed:.2f}s，CPU线程: {optimal_threads}，总核心数: {cpu_count}）\n")
-            return model
-        
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_load_model)
-            try:
-                self._model = future.result(timeout=timeout)
-            except FuturesTimeoutError:
-                future.cancel()
-                raise TimeoutError(f"模型加载超时（{timeout}秒）")
-            except Exception as e:
-                future.cancel()
-                raise RuntimeError(f"模型加载失败：{e}")
+    def _load_model_from_loader(self):
+        """从模型加载器获取已预加载的模型"""
+        try:
+            # 检查模型是否已加载
+            if model_loader.is_loaded():
+                self._model = model_loader.get_model()
+                print(f"✅ 使用已预加载的模型: {model_loader.get_model_size()}")
+            else:
+                # 如果未加载，则通过加载器加载
+                detector_type = self._detect_device()
+                device = detector_type['device']
+                compute_type = detector_type['compute_type']
+                
+                self._model = model_loader.load_model(
+                    model_size=self.config.model_size,
+                    device=device,
+                    compute_type=compute_type
+                )
+        except Exception as e:
+            raise RuntimeError(f"模型加载失败：{e}")
 
 
     def _detect_device(self) -> Dict[str, str]:

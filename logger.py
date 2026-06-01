@@ -1,6 +1,6 @@
 """
 业务日志模块
-结构化日志记录，支持 MySQL 持久化
+结构化日志记录，支持 MySQL 持久化和新式日志系统
 """
 
 import sys
@@ -10,13 +10,14 @@ from typing import Optional
 from loguru import logger
 
 from database import db_manager
+from logger_config import LoggerConfig, get_app_logger, get_business_logger, get_error_logger
 
 
 class BusinessLogger:
-    """业务日志管理器"""
+    """业务日志管理器（兼容旧版API，内部使用新日志系统）"""
     
     def __init__(self):
-        # 配置 loguru
+        # 配置 loguru（保持向后兼容）
         logger.remove()  # 移除默认处理器
         
         # 控制台输出
@@ -37,13 +38,26 @@ class BusinessLogger:
         )
         
         self.logger = logger
+        
+        # 初始化新的日志系统
+        self.app_logger = get_app_logger()
+        self.business_logger = get_business_logger()
+        self.error_logger = get_error_logger()
+        
+        # 定期清理过期日志
+        try:
+            LoggerConfig.cleanup_old_logs(retention_days=30)
+        except Exception as e:
+            self.logger.warning(f"日志清理失败: {e}")
     
     def log_info(self, module: str, action: str, message: str, 
                 task_id: str = None, audio_id: str = None, **kwargs):
         """记录 INFO 日志"""
-        self.logger.info(f"[{module}:{action}] {message}")
+        # 使用新日志系统
+        self.business_logger.info(f"[{module}:{action}] {message}", 
+                                  extra={'task_id': task_id, 'audio_id': audio_id})
         
-        # 异步写入数据库
+        # 异步写入数据库（保持向后兼容）
         try:
             db_manager.log_business_action(
                 level='INFO',
@@ -81,7 +95,9 @@ class BusinessLogger:
         error_msg = f"[{module}:{action}] {str(error)}"
         stack_trace = traceback.format_exc()
         
-        self.logger.error(f"{error_msg}\n{stack_trace}")
+        # 使用新日志系统
+        self.error_logger.error(f"{error_msg}\n{stack_trace}",
+                               extra={'task_id': task_id, 'audio_id': audio_id})
         
         try:
             db_manager.log_business_action(

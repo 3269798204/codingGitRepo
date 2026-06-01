@@ -123,6 +123,75 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     FOREIGN KEY (task_id) REFERENCES batch_tasks(task_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='断点续传检查点表';
 
+-- 6. 系统配置表
+CREATE TABLE IF NOT EXISTS system_configs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    config_key VARCHAR(128) UNIQUE NOT NULL COMMENT '配置键',
+    config_value TEXT NOT NULL COMMENT '配置值',
+    config_type ENUM('string', 'int', 'float', 'bool', 'json') DEFAULT 'string' COMMENT '配置类型',
+    description VARCHAR(512) COMMENT '配置描述',
+    category VARCHAR(64) COMMENT '配置分类 (asr/llm/batch/system)',
+    is_editable BOOLEAN DEFAULT TRUE COMMENT '是否可编辑',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    
+    INDEX idx_category (category),
+    INDEX idx_config_key (config_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='系统配置表';
+
+-- 插入默认配置
+INSERT INTO system_configs (config_key, config_value, config_type, description, category, is_editable) VALUES
+('asr.model_size', 'small', 'string', 'ASR模型大小 (tiny/base/small/medium/large)', 'asr', TRUE),
+('asr.beam_size', '3', 'int', 'Beam Size', 'asr', TRUE),
+('asr.temperature', '0.0', 'float', '采样温度', 'asr', TRUE),
+('asr.language', 'zh', 'string', '识别语言', 'asr', TRUE),
+('asr.device', 'cpu', 'string', '计算设备 (cpu/cuda)', 'asr', FALSE),
+('asr.compute_type', 'int8', 'string', '计算类型 (int8/float16/float32)', 'asr', FALSE),
+('llm.api_key', '', 'string', 'LLM API密钥', 'llm', TRUE),
+('llm.base_url', 'https://api.deepseek.com/v1', 'string', 'LLM API基础URL', 'llm', TRUE),
+('llm.model', 'deepseek-chat', 'string', 'LLM模型名称', 'llm', TRUE),
+('batch.max_workers', '2', 'int', '批处理最大并发数', 'batch', TRUE),
+('batch.enable_checkpoint', 'true', 'bool', '启用断点续传', 'batch', TRUE),
+('batch.enable_cache', 'true', 'bool', '启用结果缓存', 'batch', TRUE),
+('system.app_title', '语音识别分析系统 v3.0', 'string', '应用标题', 'system', TRUE),
+('system.debug_mode', 'false', 'bool', '调试模式', 'system', TRUE);
+
+-- 7. 用户表
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(64) UNIQUE NOT NULL COMMENT '用户名',
+    password_hash VARCHAR(128) NOT NULL COMMENT '密码哈希',
+    salt VARCHAR(128) NOT NULL COMMENT '盐值',
+    role VARCHAR(32) DEFAULT 'user' COMMENT '角色 (admin/user)',
+    email VARCHAR(128) COMMENT '邮箱',
+    is_active BOOLEAN DEFAULT TRUE COMMENT '是否激活',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    
+    INDEX idx_username (username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
+
+-- 8. 角色表
+CREATE TABLE IF NOT EXISTS roles (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    role_name VARCHAR(32) UNIQUE NOT NULL COMMENT '角色名称',
+    permissions_json JSON COMMENT '权限列表 (JSON)',
+    description VARCHAR(512) COMMENT '角色描述',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    
+    INDEX idx_role_name (role_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='角色表';
+
+-- 插入默认管理员账户（密码: admin123）
+-- 注意：实际使用时请修改默认密码
+INSERT INTO users (username, password_hash, salt, role, email) VALUES
+('admin', 
+ '122f137a81dc44e6ab559de0b98b43dc39169964e7ca35d6cc3962834c8732df',
+ 'default_salt_change_in_production',
+ 'admin',
+ 'admin@example.com');
+
 -- 插入示例数据（可选）
 INSERT INTO business_logs (log_level, module, action, message) VALUES
 ('INFO', 'system', 'startup', '语音识别分析系统启动'),
