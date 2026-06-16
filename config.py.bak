@@ -1,0 +1,201 @@
+"""
+语音识别 Web UI 系统 - 配置管理
+"""
+
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+from pathlib import Path
+
+@dataclass
+class DatabaseConfig:
+    """MySQL 数据库配置"""
+    host: str = "rm-2vcww6h31l270m9sm3o.mysql.cn-chengdu.rds.aliyuncs.com"
+    port: int = 3306
+    user: str = "tbhx01"
+    password: str = "Aa@82320020"
+    database: str = "voice_analysis"
+    pool_size: int = 10
+    charset: str = "utf8mb4"
+    
+    @property
+    def url(self):
+        return f"mysql+pymysql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}?charset={self.charset}"
+
+@dataclass
+class ASRConfig:
+    """ASR 配置"""
+    # 模型选择
+    model_size: str = "small"  # tiny, base, small, medium, large
+    language: str = "zh"
+    
+    # 解码参数
+    beam_size: int = 3
+    temperature: float = 0.0
+    
+    # VAD 参数
+    vad_filter: bool = True
+    min_silence_duration_ms: int = 500
+    speech_pad_ms: int = 200
+    
+    # 其他参数
+    condition_on_previous_text: bool = False
+    compression_ratio_threshold: float = 2.4
+    no_speech_threshold: float = 0.6
+    word_timestamps: bool = False
+    
+    # 超时配置（秒）
+    timeout: int = 600
+
+@dataclass
+class BatchConfig:
+    """批处理配置"""
+    # 并发控制
+    max_cpu_workers: int = 4  # CPU 模式最大并发数
+    max_gpu_workers: int = 1  # GPU 模式最大并发数（GPU 本身并行）
+    
+    # 长音频分段
+    chunk_duration: int = 300  # 分段时长（秒）
+    enable_chunking: bool = True
+    
+    # 断点续传
+    checkpoint_dir: str = "./checkpoints"
+    enable_checkpoint: bool = True
+    
+    # 缓存
+    cache_dir: str = "./cache"
+    enable_cache: bool = True
+
+@dataclass
+class LogConfig:
+    """日志配置"""
+    log_dir: str = "./logs"
+    log_level: str = "INFO"
+    max_file_size: int = 10 * 1024 * 1024  # 10MB
+    backup_count: int = 5
+
+@dataclass
+class AppConfig:
+    """应用总配置"""
+    # 应用信息
+    app_name: str = "语音识别分析系统"
+    version: str = "3.0.0"
+    
+    # 服务器配置
+    host: str = "0.0.0.0"
+    port: int = 8501  # Streamlit 默认端口
+    api_port: int = 8000  # FastAPI 端口
+    
+    # 子配置
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    asr: ASRConfig = field(default_factory=ASRConfig)
+    batch: BatchConfig = field(default_factory=BatchConfig)
+    log: LogConfig = field(default_factory=LogConfig)
+    
+    # 文件路径
+    base_dir: Path = Path(__file__).parent
+    upload_dir: Path = field(init=False)
+    result_dir: Path = field(init=False)
+    
+    def __post_init__(self):
+        self.upload_dir = self.base_dir / "uploads"
+        self.result_dir = self.base_dir / "results"
+        
+        # 创建必要的目录
+        for dir_path in [self.upload_dir, self.result_dir, 
+                        Path(self.batch.checkpoint_dir),
+                        Path(self.batch.cache_dir),
+                        Path(self.log.log_dir)]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+
+# 全局配置实例
+config = AppConfig()
+
+def get_hardware_optimized_config() -> dict:
+    """
+    根据硬件配置返回最优的 ASR 参数
+    
+    Returns:
+        dict: 推荐的配置参数
+    """
+    import torch
+    
+    recommended = {
+        "model_size": "small",
+        "beam_size": 3,
+        "compute_type": "int8",
+        "max_workers": 4,
+        "description": "默认配置（CPU 模式）"
+    }
+    
+    # 检测 CUDA (NVIDIA GPU)
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        
+        if gpu_memory >= 8:
+            recommended.update({
+                "model_size": "large",
+                "beam_size": 5,
+                "compute_type": "float16",
+                "max_workers": 1,
+                "description": f"NVIDIA GPU ({gpu_name}, {gpu_memory:.1f}GB) - 高精度模式"
+            })
+        elif gpu_memory >= 4:
+            recommended.update({
+                "model_size": "medium",
+                "beam_size": 5,
+                "compute_type": "float16",
+                "max_workers": 1,
+                "description": f"NVIDIA GPU ({gpu_name}, {gpu_memory:.1f}GB) - 平衡模式"
+            })
+        else:
+            recommended.update({
+                "model_size": "small",
+                "beam_size": 3,
+                "compute_type": "float16",
+                "max_workers": 1,
+                "description": f"NVIDIA GPU ({gpu_name}, {gpu_memory:.1f}GB) - 速度模式"
+            })
+    
+    # 检测 MPS (Apple Silicon)
+    elif torch.backends.mps.is_available():
+        recommended.update({
+            "model_size": "medium",
+            "beam_size": 3,
+            "compute_type": "float16",
+            "max_workers": 2,
+            "description": "Apple Silicon (MPS) - 平衡模式"
+        })
+    
+    # CPU 模式 - 根据核心数调整
+    else:
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+        
+        if cpu_count >= 8:
+            recommended.update({
+                "model_size": "small",
+                "beam_size": 3,
+                "compute_type": "int8",
+                "max_workers": 4,
+                "description": f"高性能 CPU ({cpu_count}核) - 平衡模式"
+            })
+        elif cpu_count >= 4:
+            recommended.update({
+                "model_size": "base",
+                "beam_size": 3,
+                "compute_type": "int8",
+                "max_workers": 2,
+                "description": f"普通 CPU ({cpu_count}核) - 速度模式"
+            })
+        else:
+            recommended.update({
+                "model_size": "tiny",
+                "beam_size": 1,
+                "compute_type": "int8",
+                "max_workers": 1,
+                "description": f"低配 CPU ({cpu_count}核) - 极速模式"
+            })
+    
+    return recommended
