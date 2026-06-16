@@ -6,12 +6,11 @@ Streamlit Web UI 主应用
 import json
 import os
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 import time
 from datetime import datetime
+from typing import Optional
 
 from compat_layer import db_manager
 from config import config
@@ -32,6 +31,23 @@ st.set_page_config(
 # 关键：只在首次运行时初始化，刷新时保留已有状态
 if 'submitted_requests' not in st.session_state:
     st.session_state.submitted_requests = set()
+
+if 'ui_css_injected' not in st.session_state:
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDataFrameEditedCell"],
+        div[data-testid="stDataFrameEditableCell"][data-content-is-edited="true"],
+        div[data-baseweb="data-table"] [data-is-edited="true"] {
+            background-color: transparent !important;
+            box-shadow: none !important;
+            border: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    st.session_state.ui_css_injected = True
 
 # 确保登录相关字段存在（防止刷新时丢失）
 if 'logged_in' not in st.session_state:
@@ -79,7 +95,7 @@ if not require_auth():
 # 这些对象只会在首次调用时创建，后续请求直接使用缓存
 
 # 使用API客户端（已全局初始化）
-# batch_processor, csv_parser, report_gen, hardware_info 都通过API调用获取
+# 批量处理、解析器等能力均通过后端 API 获取
 
 
 # ==================== 通用组件 ====================
@@ -153,12 +169,162 @@ def render_json_with_copy(data: dict, label: str = "JSON数据"):
         st.success("✅ 已显示JSON，请手动复制（Ctrl+C / Cmd+C）")
 
 
-@st.cache_data(show_spinner=False)
-def get_customer_code(task_id: str) -> str:
+def validate_uri(uri: str) -> bool:
+    """验证URI是否为有效的http/https地址"""
+    if not uri:
+        return False
+    uri = uri.strip()
+    return uri.startswith('http://') or uri.startswith('https://')
+
+
+ROLE_ALIASES = {
+    "customer": "customer",
+    "user": "customer",
+    "client": "customer",
+    "客户": "customer",
+    "顾客": "customer",
+    "乘客": "customer",
+    "customer_service": "customer_service",
+    "agent": "customer_service",
+    "客服": "customer_service",
+    "坐席": "customer_service",
+    "质检": "customer_service",
+    "话务员": "customer_service",
+    "system": "system",
+    "系统": "system",
+    "机器人": "system",
+}
+
+
+ROLE_LABELS = {
+    "customer": "客户",
+    "customer_service": "客服",
+    "system": "系统",
+    "unknown": "其他角色",
+}
+
+
+def _normalize_role(role: str) -> str:
+    if not role:
+        return "unknown"
+
+    cleaned = str(role).strip()
+    lowered = cleaned.lower()
+
+    for candidate in (cleaned, lowered, cleaned.replace(" ", ""), lowered.replace(" ", "")):
+        if candidate in ROLE_ALIASES:
+            return ROLE_ALIASES[candidate]
+
+    return lowered or "unknown"
+
+
+def _format_role_label(role: str) -> str:
+    normalized = _normalize_role(role)
+    if normalized in ROLE_LABELS:
+        return ROLE_LABELS[normalized]
+    return role.replace('_', ' ').title() if role else "其他角色"
+
+
+def build_participant_summaries(participants: list) -> dict:
+    """根据participants结构化数据生成角色摘要文本"""
+    summaries = {}
+
+    for participant in participants or []:
+        role = _normalize_role(participant.get('role'))
+        fragments = []
+
+        summary_text = (participant.get('summary') or '').strip()
+        if summary_text:
+            fragments.append(summary_text)
+
+        emotion_info = participant.get('emotion_analysis') or {}
+        emotion_desc = (emotion_info.get('emotion_description') or '').strip()
+        if emotion_desc and emotion_desc not in fragments:
+            fragments.append(emotion_desc)
+        else:
+            primary_emotions = emotion_info.get('primary_emotions') or []
+            if primary_emotions:
+                fragments.append("情绪：" + "、".join(primary_emotions))
+
+        if participant.get('abusive_remarks'):
+            examples = participant.get('abusive_examples')
+            if examples:
+                fragments.append("包含辱骂：" + "、".join(examples))
+            else:
+                fragments.append("包含辱骂言论")
+
+        if fragments:
+            summaries.setdefault(role, []).append("；".join(fragments))
+
+    return {role: "；".join(texts) for role, texts in summaries.items()}
+
+
+def render_participant_summaries(participants: list) -> bool:
+    """在前端渲染角色摘要，返回是否渲染成功"""
+    summaries = build_participant_summaries(participants)
+    if not summaries:
+        return False
+
+    ordered_roles = []
+    for preferred in ("customer", "customer_service", "system", "unknown"):
+        if preferred in summaries and preferred not in ordered_roles:
+            ordered_roles.append(preferred)
+
+    for role in summaries:
+        if role not in ordered_roles:
+            ordered_roles.append(role)
+
+    for role in ordered_roles:
+        st.markdown(f"- **{_format_role_label(role)}**: {summaries[role]}")
+
+    return True
+
+
+def _resolve_result_display_label(result: dict, index: int) -> str:
+    """为批量任务记录生成更友好的展示标题"""
+    extra = result.get('extra_data') or {}
+
+    preferred_keys = [
+        "客户名称", "客户编码", "客户编号", "客户ID", "customer", "customer_id",
+        "手机号", "手机", "mobile", "phone"
+    ]
+
+    for key in preferred_keys:
+        value = extra.get(key)
+        if value:
+            return str(value)
+
+    audio_url = result.get('audio_url') or ''
+    if audio_url:
+        return audio_url.rsplit('/', 1)[-1] or audio_url
+
+    return f"记录 {index}"
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_hardware_info_cached(token: Optional[str]) -> dict:
+    return api_client.get_hardware_info()
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def fetch_configs_cached(token: Optional[str], category: Optional[str]) -> dict:
+    return api_client.list_configs(category)
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def fetch_users_cached(token: Optional[str]) -> dict:
+    return api_client.list_users()
+
+
+def _extract_customer_code_from_result(result: dict) -> str:
+    # 客户编码取值逻辑为 audio_result.customer_no
+    return result.get('customer_no') or "N/A"
+
+
+def _fetch_customer_code(task_id: str) -> str:
     """
-    推断任务的客户编码
-    - 单个音频：直接使用音频URL
-    - 批量导入：优先从原始Excel数据中取客户编号/手机号/身份证号等唯一标识
+    获取任务的客户编码
+    客户编码取值逻辑为 audio_result.customer_no
     """
 
     try:
@@ -171,64 +337,61 @@ def get_customer_code(task_id: str) -> str:
         return "N/A"
 
     result = results[0]
-    origin_data = result.get('origin_data') or {}
-    task_type = origin_data.get('type')
+    return _extract_customer_code_from_result(result)
 
-    # 单个音频：直接返回音频URL
-    if task_type == 'single_audio':
-        return origin_data.get('audio_url') or result.get('audio_url') or "N/A"
 
-    # 批量导入：从excel_data/extra_data中提取客户唯一编号
-    excel_data = origin_data.get('excel_data') or result.get('extra_data') or {}
-    priority_keywords = [
-        "客户编码", "客户编号", "customer", "customer_id", "客户id", "客户ID",
-        "手机号", "手机", "mobile", "phone", "联系电话", "电话",
-        "身份证", "身份证号", "证件号", "id_number"
-    ]
+def get_customer_code(task_id: str) -> str:
+    cache = st.session_state.setdefault('_customer_code_cache', {})
+    if task_id in cache:
+        return cache[task_id]
 
-    for keyword in priority_keywords:
-        for col, val in excel_data.items():
-            if keyword.lower() in str(col).lower():
-                candidate = str(val).strip()
-                if candidate:
-                    return candidate
-
-    # 兜底：返回excel_data中的第一个非空字段，或音频URL
-    for val in excel_data.values():
-        candidate = str(val).strip()
-        if candidate:
-            return candidate
-
-    return result.get('audio_url') or "N/A"
+    # 客户编码取值逻辑为 audio_result.customer_no
+    code = _fetch_customer_code(task_id)
+    cache[task_id] = code
+    return code
 
 
 # ==================== 结果详情展示函数 ====================
 
 def show_result_detail(task_id: str):
     """显示任务结果详情（按任务类型区分）"""
-    
-    # 获取任务及结果
-    task_data = db_manager.get_task_with_results(task_id)
-    
-    if not task_data:
+
+    task_info = api_client.get_task(task_id)
+    if not task_info:
         st.error("❌ 任务不存在")
         return
-    
-    results = task_data.get('results', [])
-    
-    if not results:
+
+    try:
+        initial_response = api_client.get_task_results(task_id, limit=2)
+        initial_results = initial_response.get('results', [])
+    except Exception as exc:
+        st.error(f"❌ 获取任务结果失败: {exc}")
+        return
+
+    if not initial_results:
         st.info("暂无结果数据")
         return
-    
-    # 判断任务类型：单个音频 vs Excel导入
-    is_single_audio = len(results) == 1
-    
+
+    is_single_audio = len(initial_results) == 1
+
     if is_single_audio:
-        # 单个音频任务
-        _show_single_audio_detail(task_data, results[0])
+        result = initial_results[0]
+        _show_single_audio_detail(task_info, result)
+        st.session_state.setdefault('_customer_code_cache', {})[task_id] = _extract_customer_code_from_result(result)
     else:
-        # Excel导入任务
-        _show_excel_import_detail(task_data, results)
+        try:
+            full_response = api_client.get_task_results(task_id, limit=1000)
+            results = full_response.get('results', [])
+        except Exception as exc:
+            st.error(f"❌ 获取批量结果失败: {exc}")
+            return
+
+        if not results:
+            st.info("暂无结果数据")
+            return
+
+        st.session_state.setdefault('_customer_code_cache', {})[task_id] = _extract_customer_code_from_result(results[0])
+        _show_excel_import_detail(task_info, results)
 
 
 def _show_single_audio_detail(task_data: dict, result: dict):
@@ -251,10 +414,10 @@ def _show_single_audio_detail(task_data: dict, result: dict):
     
     # 构建分析数据表格
     analysis_data = [
-        {"指标": "音频时长", "值": f"{result.get('duration', 0):.1f} 秒"},
-        {"指标": "处理时间", "值": f"{result.get('processing_time', 0):.1f} 秒"},
-        {"指标": "实时因子", "值": f"{result.get('realtime_factor', 0):.2f}x"},
-        {"指标": "置信度", "值": f"{result.get('confidence', 0):.2%}"},
+        {"指标": "音频时长", "值": f"{result.get('duration') or 0:.1f} 秒"},
+        {"指标": "处理时间", "值": f"{result.get('processing_time') or 0:.1f} 秒"},
+        {"指标": "实时因子", "值": f"{result.get('realtime_factor') or 0:.2f}x"},
+        {"指标": "置信度", "值": f"{result.get('confidence') or 0:.2%}"},
         {"指标": "语言", "值": result.get('language', 'zh')},
         {"指标": "是否包含辱骂", "值": "是 ⚠️" if result.get('has_abusive_language') else "否 ✅"},
     ]
@@ -263,14 +426,21 @@ def _show_single_audio_detail(task_data: dict, result: dict):
     st.dataframe(df_analysis, use_container_width=True, hide_index=True)
     
     # AI对话摘要
-    if result.get('dialogue_summary'):
+    dialogue_summary = (result.get('dialogue_summary') or '').strip()
+    if dialogue_summary:
         st.markdown("**对话摘要**:")
-        st.info(result.get('dialogue_summary'))
-        
-        abusive_words = result.get('abusive_words', [])
-        if abusive_words:
-            st.markdown("**辱骂词汇**:")
-            st.warning(", ".join(abusive_words))
+        st.info(dialogue_summary)
+
+    participants = result.get('participants') or []
+    if participants:
+        st.markdown("**对话角色摘要**:")
+        if not render_participant_summaries(participants):
+            st.info("暂无可用的角色摘要文本")
+
+    abusive_words = result.get('abusive_words') or result.get('abusive_words_list') or []
+    if abusive_words:
+        st.markdown("**辱骂词汇**:")
+        st.warning(", ".join(abusive_words))
     
     # CSV导出
     st.markdown("---")
@@ -295,8 +465,8 @@ def _show_excel_import_detail(task_data: dict, results: list):
     
     # 1. 显示原始输入数据（如果有）
     if origin_data:
-        with st.expander("📍 查看原始输入数据", expanded=False):
-            render_json_with_copy(origin_data, "原始输入数据")
+        st.markdown("#### 📍 原始输入数据")
+        render_json_with_copy(origin_data, "原始输入数据")
     
     # 2. 显示所有Excel字段 + 语音识别内容 + LLM分析
     st.markdown("#### 📊 完整数据表格")
@@ -316,6 +486,15 @@ def _show_excel_import_detail(task_data: dict, results: list):
         # 添加LLM分析字段
         row['对话摘要'] = result.get('dialogue_summary', '')
         row['是否辱骂'] = '是' if result.get('has_abusive_language') else '否'
+        role_summaries = build_participant_summaries(result.get('participants') or [])
+        row['客户摘要'] = role_summaries.get('customer') or role_summaries.get('user') or ''
+        row['客服摘要'] = role_summaries.get('customer_service') or role_summaries.get('agent') or ''
+        other_roles = [
+            f"{_format_role_label(role)}: {content}"
+            for role, content in role_summaries.items()
+            if role not in {'customer', 'user', 'customer_service', 'agent'}
+        ]
+        row['其他角色摘要'] = " | ".join(other_roles) if other_roles else ''
         
         # 添加其他信息
         row['音频URL'] = result.get('audio_url', '')
@@ -327,6 +506,31 @@ def _show_excel_import_detail(task_data: dict, results: list):
     
     df_results = pd.DataFrame(data_list)
     st.dataframe(df_results, use_container_width=True, hide_index=True)
+
+    # 2.1 展示每条记录的对话角色摘要
+    st.markdown("#### 🗣️ 对话角色摘要")
+    any_summary = False
+    for idx, result in enumerate(results, start=1):
+        participants = result.get('participants') or []
+        label = _resolve_result_display_label(result, idx)
+
+        st.markdown(f"##### 🎧 {label}")
+        dialogue_summary = (result.get('dialogue_summary') or '').strip()
+        if dialogue_summary:
+            st.markdown("**对话摘要:**")
+            st.info(dialogue_summary)
+
+        if participants:
+            if render_participant_summaries(participants):
+                any_summary = True
+            else:
+                st.info("暂无可用的角色摘要文本")
+        else:
+            st.info("暂无参与者信息")
+
+    if not any_summary:
+        st.info("暂无可用的角色摘要文本")
+
     
     # 3. CSV导出
     st.markdown("---")
@@ -393,25 +597,25 @@ default_rec = {
 }
 
 try:
-    hardware_info = api_client.get_hardware_info()
-    hw = hardware_info['hardware']
-    rec = hardware_info['recommended']
-    
-    st.sidebar.text(f"CPU: {hw['cpu_cores']} 核")
-    st.sidebar.text(f"GPU: {hw['gpu_type']}")
-    
-    if hw.get('gpu_name'):
-        st.sidebar.text(f"型号: {hw['gpu_name']}")
-    
-    if hw.get('gpu_memory_gb', 0) > 0:
-        st.sidebar.text(f"显存: {hw['gpu_memory_gb']:.1f} GB")
-    
-    # 推荐配置
+    hardware_info = fetch_hardware_info_cached(st.session_state.get('session_token'))
+    hw = hardware_info.get('hardware', {})
+    rec = hardware_info.get('recommended', default_rec)
+
+    if hw:
+        st.sidebar.text(f"CPU: {hw.get('cpu_cores', 'N/A')} 核")
+        st.sidebar.text(f"GPU: {hw.get('gpu_type', 'N/A')}")
+
+        if hw.get('gpu_name'):
+            st.sidebar.text(f"型号: {hw['gpu_name']}")
+
+        if hw.get('gpu_memory_gb', 0) > 0:
+            st.sidebar.text(f"显存: {hw['gpu_memory_gb']:.1f} GB")
+
     st.sidebar.markdown("### 💡 推荐配置")
-    st.sidebar.success(rec['description'])
-    st.sidebar.text(f"模型: {rec['model_size']}")
-    st.sidebar.text(f"Beam Size: {rec['beam_size']}")
-    st.sidebar.text(f"并发数: {rec['max_workers']}")
+    st.sidebar.success(rec.get('description', default_rec['description']))
+    st.sidebar.text(f"模型: {rec.get('model_size', default_rec['model_size'])}")
+    st.sidebar.text(f"Beam Size: {rec.get('beam_size', default_rec['beam_size'])}")
+    st.sidebar.text(f"并发数: {rec.get('max_workers', default_rec['max_workers'])}")
 except Exception as e:
     st.sidebar.warning(f"⚠️ 无法获取硬件信息: {str(e)}")
     rec = default_rec
@@ -438,30 +642,42 @@ st.markdown("---")
 
 # Tab 切换
 # 使用session_state跟踪当前tab，实现局部刷新
-tab_names = ["📊 仪表盘", "🎵 单个音频", "📁 批量处理", "📈 统计报表", "⚙️ 系统配置"]
+tab_names = ["📊 仪表盘", "🎵 单个音频", "📁 批量处理", "⚙️ 系统配置"]
 if 'current_tab' not in st.session_state:
     st.session_state.current_tab = 0
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(tab_names)
+tab1, tab2, tab3, tab4 = st.tabs(tab_names)
 
 
 # ==================== Tab 1: 仪表盘 ====================
 
 with tab1:
     st.header("📊 系统概览")
+
+    refresh_col, _ = st.columns([1, 3])
+    with refresh_col:
+        if st.button("🔄 刷新任务列表", key="refresh_tasks"):
+            # 清除所有任务相关的缓存键
+            for k in list(st.session_state.keys()):
+                if k.startswith("_tasks_cache") or k == '_customer_code_cache':
+                    st.session_state.pop(k, None)
+            st.rerun()
     
-    # 查询任务统计（每次切换到Tab都会重新执行）
+    # 1. 始终查询并展示全局任务统计指标（不随列表查询过滤而改变，展示系统真实概览）
     try:
-        tasks_response = api_client.list_tasks(limit=100)
-        tasks = tasks_response.get('tasks', [])
+        if st.session_state.get('_tasks_cache_all') is None:
+            st.session_state['_tasks_cache_all'] = api_client.list_tasks(limit=100)
+        all_tasks_response = st.session_state['_tasks_cache_all']
+        all_tasks = all_tasks_response.get('tasks', [])
     except Exception as e:
-        st.error(f"❌ 获取任务列表失败: {str(e)}")
-        tasks = []
+        all_tasks = []
+        from logger import business_logger
+        business_logger.log_error('app', 'list_all_tasks_dashboard', e)
     
-    total_tasks = len(tasks)
-    running_tasks = sum(1 for t in tasks if t['status'] == 'running')
-    completed_tasks = sum(1 for t in tasks if t['status'] == 'completed')
-    failed_tasks = sum(1 for t in tasks if t['status'] == 'failed')
+    total_tasks = len(all_tasks)
+    running_tasks = sum(1 for t in all_tasks if t['status'] == 'running')
+    completed_tasks = sum(1 for t in all_tasks if t['status'] == 'completed')
+    failed_tasks = sum(1 for t in all_tasks if t['status'] == 'failed')
     
     # 显示统计卡片
     col1, col2, col3, col4 = st.columns(4)
@@ -478,68 +694,211 @@ with tab1:
     with col4:
         st.metric("失败", failed_tasks)
     
-    # 最近任务列表
+    # 最近任务列表与多维度查询
     st.subheader("📋 最近任务")
     
+    # 2. 多维度查询输入框（支持任务名称、客户编码、用户编号的后台数据库联合查询）
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    with filter_col1:
+        task_name_filter = st.text_input("🔍 按任务名称查询", placeholder="支持模糊匹配任务名称", key="task_name_query_filter")
+    with filter_col2:
+        customer_filter = st.text_input("👤 按客户编码查询", placeholder="与语音结果等值连接过滤", key="customer_code_query_filter")
+    with filter_col3:
+        user_filter = st.text_input("🆔 按用户编号查询", placeholder="输入用户编号过滤", key="user_id_query_filter")
+    with filter_col4:
+        task_filter = st.text_input("🆔 按任务编码查询", placeholder="输入任务ID过滤", key="task_id_query_filter")
+    
+    # 3. 动态从后台数据库查询任务列表
+    try:
+        # 获取当前用户信息
+        is_admin = st.session_state.get('user_role') == 'admin'
+        current_username = st.session_state.get('username')
+        
+        # 使用过滤条件组合生成缓存键，保证输入变化时自动刷新后端请求
+        cache_key = f"_tasks_cache_{task_name_filter}_{customer_filter}_{user_filter}_{is_admin}_{current_username}"
+        if st.session_state.get(cache_key) is None:
+            # 清除其他旧的带条件任务列表缓存
+            for k in list(st.session_state.keys()):
+                if k.startswith("_tasks_cache_"):
+                    st.session_state.pop(k, None)
+            st.session_state[cache_key] = api_client.list_tasks(
+                limit=100,
+                customer_no=customer_filter if customer_filter else None,
+                task_name=task_name_filter if task_name_filter else None,
+                user_id=user_filter if (user_filter and is_admin) else None,
+                is_admin=is_admin,
+                current_username=current_username
+            )
+        tasks_response = st.session_state[cache_key]
+        tasks = tasks_response.get('tasks', [])
+    except Exception as e:
+        st.error(f"❌ 获取任务列表失败: {str(e)}")
+        # 记录详细错误到后端日志
+        from logger import business_logger
+        business_logger.log_error('app', 'list_tasks_with_filters', e)
+        tasks = []
+    
     if tasks:
-        df_tasks = pd.DataFrame(tasks)
+        cache = st.session_state.setdefault('_customer_code_cache', {})
 
-        # 支持按任务ID筛选
-        task_filter = st.text_input("🔍 按任务编码筛选", placeholder="输入任务ID的一部分即可", key="task_code_filter")
+        df_tasks = pd.DataFrame(tasks)
+        if 'customer_code' not in df_tasks.columns:
+            df_tasks['customer_code'] = None
+
+        def _resolve_customer_code(row):
+            config_data = row.get('config') or {}
+            code = config_data.get('primary_customer_code')
+            if code:
+                return code
+            if row.get('customer_code'):
+                return row.get('customer_code')
+            return cache.get(row['task_id'])
+
+        df_tasks['customer_code'] = df_tasks.apply(_resolve_customer_code, axis=1)
+
+        for tid, code in zip(df_tasks['task_id'], df_tasks['customer_code']):
+            code_str = str(code).strip() if code else ""
+            if code_str:
+                cache[tid] = code_str
+
+        current_task_ids = set(df_tasks['task_id'].tolist())
+        stale_keys = [tid for tid in cache if tid not in current_task_ids]
+        for tid in stale_keys:
+            cache.pop(tid, None)
+
+        # 4. 前端辅助任务ID本地筛选
         if task_filter:
             df_tasks = df_tasks[df_tasks['task_id'].str.contains(task_filter, case=False, na=False)]
+        
+        customer_code_cache = cache
 
         # 格式化显示
         # 重命名列
-        df_display = df_tasks[['task_id', 'task_name', 'status', 'total_count', 'progress', 'created_at']].copy()
+        df_display = df_tasks[['task_id', 'task_name', 'status', 'total_count', 'processed_count', 'success_count', 'progress', 'created_at']].copy()
         df_display.rename(columns={
             'task_id': '任务ID',
             'task_name': '任务名称',
             'status': '状态',
             'total_count': '总数',
+            'processed_count': '已处理',
+            'success_count': '成功数',
             'progress': '进度',
             'created_at': '创建时间'
         }, inplace=True)
 
-        # 客户编码列：紧挨任务ID（缓存加速）
-        customer_code_map = {row['任务ID']: get_customer_code(row['任务ID']) for _, row in df_display.iterrows()}
-        df_display.insert(1, '客户编码', df_display['任务ID'].apply(lambda tid: customer_code_map.get(tid, "N/A")))
-
-        # 格式化显示
-        df_display['进度'] = df_display['进度'].apply(lambda x: f"{x:.1f}%")
-        df_display['创建时间'] = pd.to_datetime(df_display['创建时间']).dt.strftime('%Y-%m-%d %H:%M')
-        # 详情选择列：使用 data_editor 的复选框，不需要跳转
-        df_display.insert(0, '查看详情', False)
-
-        edited = st.data_editor(
-            df_display[['查看详情', '任务ID', '客户编码', '任务名称', '状态', '总数', '进度', '创建时间']],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "查看详情": st.column_config.CheckboxColumn("详情", width="small"),
-                "任务ID": st.column_config.TextColumn("任务ID", width="medium"),
-                "客户编码": st.column_config.TextColumn("客户编码", width="medium"),
-                "任务名称": st.column_config.TextColumn("任务名称", width="large"),
-                "状态": st.column_config.TextColumn("状态", width="small"),
-                "总数": st.column_config.NumberColumn("总数", width="small"),
-                "进度": st.column_config.TextColumn("进度", width="small"),
-                "创建时间": st.column_config.TextColumn("创建时间", width="medium")
-            },
-            key="task_data_editor"
+        # 客户编码列：紧挨任务ID（从audio_result.customer_no获取）
+        customer_code_map = {
+            tid: (str(code).strip() if code else customer_code_cache.get(tid, "N/A"))
+            for tid, code in zip(df_tasks['task_id'], df_tasks['customer_code'])
+        }
+        df_display.insert(
+            1,
+            '客户编码',
+            df_display['任务ID'].apply(lambda tid: customer_code_map.get(tid, customer_code_cache.get(tid, "N/A")))
         )
 
-        selected_rows = edited[edited['查看详情']]
+        # 格式化显示 - 进度显示为百分比和已完成数/总数
+        def format_progress(row):
+            total = row['总数']
+            processed = row['已处理']
+            success = row['成功数']
+            progress_pct = row['进度']
+            return f"{progress_pct:.1f}% ({success}/{total})"
+        
+        df_display['进度'] = df_display.apply(format_progress, axis=1)
+        df_display['创建时间'] = pd.to_datetime(df_display['创建时间']).dt.strftime('%Y-%m-%d %H:%M')
+        st.caption("💡 以下以表格形式展示任务列表，单选查看详情")
+        st.caption("👉 表格默认显示 5 行，可滚动查看更多任务")
+
+        current_selected = st.session_state.get('selected_task_id')
+
+        valid_task_ids = set(df_display['任务ID'])
+        if current_selected and current_selected not in valid_task_ids:
+            st.session_state.pop('selected_task_id', None)
+            current_selected = None
+
+        df_table = df_display.copy()
+        df_table.insert(0, '查看详情', df_table['任务ID'].apply(lambda tid: tid == current_selected))
+        
+        # 添加继续执行按钮列（仅限未完成任务）
+        def can_continue_task(status):
+            return status in ['pending', 'processing', 'paused', 'failed']
+        
+        df_table.insert(1, '继续执行', df_table['状态'].apply(lambda s: can_continue_task(s)))
+        
+        visible_rows = min(len(df_table), 5)
+        header_height = 38
+        row_height = 44
+        table_height = header_height + max(1, visible_rows) * row_height
+
+        if 'task_table_prev' not in st.session_state:
+            st.session_state['task_table_prev'] = df_table.copy()
+
+        editor_result = st.data_editor(
+            df_table,
+            hide_index=True,
+            use_container_width=True,
+            height=table_height,
+            column_config={
+                '查看详情': st.column_config.CheckboxColumn(
+                    '查看详情',
+                    help='勾选后加载该任务详情',
+                    default=False
+                ),
+                '继续执行': st.column_config.CheckboxColumn(
+                    '继续执行',
+                    help='勾选后继续执行该任务（仅限未完成任务）',
+                    default=False
+                )
+            },
+            disabled=[col for col in df_table.columns if col not in ['查看详情', '继续执行']],
+            key='task_table_editor'
+        )
+
+        prev_table = st.session_state.get('task_table_prev')
+        if prev_table is None or list(prev_table['任务ID']) != list(editor_result['任务ID']):
+            st.session_state['task_table_prev'] = editor_result.copy()
+        else:
+            # 处理查看详情勾选
+            diff_mask = editor_result['查看详情'] != prev_table['查看详情']
+            if diff_mask.any():
+                last_changed_idx = diff_mask[diff_mask].index[-1]
+                selected_task_id = editor_result.iloc[last_changed_idx]['任务ID']
+                if editor_result.iloc[last_changed_idx]['查看详情']:
+                    st.session_state['selected_task_id'] = selected_task_id
+                else:
+                    if st.session_state.get('selected_task_id') == selected_task_id:
+                        st.session_state.pop('selected_task_id', None)
+                st.session_state['task_table_prev'] = editor_result.copy()
+                st.rerun()
+            
+            # 处理继续执行勾选
+            continue_mask = editor_result['继续执行'] != prev_table['继续执行']
+            if continue_mask.any():
+                last_changed_idx = continue_mask[continue_mask].index[-1]
+                selected_task_id = editor_result.iloc[last_changed_idx]['任务ID']
+                if editor_result.iloc[last_changed_idx]['继续执行']:
+                    try:
+                        with st.spinner(f"正在继续执行任务 {selected_task_id}..."):
+                            api_client.continue_task(selected_task_id)
+                        st.success(f"✅ 任务 {selected_task_id} 已继续执行")
+                        # 取消勾选
+                        editor_result.at[last_changed_idx, '继续执行'] = False
+                        st.session_state['task_table_prev'] = editor_result.copy()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ 继续执行任务失败: {str(e)}")
+                        # 取消勾选
+                        editor_result.at[last_changed_idx, '继续执行'] = False
+                        st.session_state['task_table_prev'] = editor_result.copy()
 
         st.markdown("---")
-        if not selected_rows.empty:
-            # 默认取首条勾选的任务
-            task_id = selected_rows.iloc[0]['任务ID']
-            st.session_state['selected_task_id'] = task_id
-            with st.expander(f"📊 任务详情: {task_id}", expanded=True):
-                show_result_detail(task_id)
+        current_selected = st.session_state.get('selected_task_id')
+        if current_selected:
+            with st.expander(f"📊 任务详情: {current_selected}", expanded=True):
+                show_result_detail(current_selected)
         else:
-            st.session_state['selected_task_id'] = None
-            st.info("勾选某行的「详情」以查看任务详情")
+            st.info("在表格中勾选“查看详情”即可展开任务详情")
     else:
         st.info("暂无任务记录")
 
@@ -556,6 +915,10 @@ with tab2:
             st.error("请输入音频 URL")
             st.stop()
         
+        if not validate_uri(audio_url):
+            st.error("请输入有效的 http/https URL")
+            st.stop()
+        
         # 前端幂等性检查
         request_key = f"single_audio_{audio_url}"
         if request_key in st.session_state.submitted_requests:
@@ -570,7 +933,7 @@ with tab2:
                 try:
                     # 调用API创建任务
                     task_response = api_client.create_task(
-                        task_name=f"单个音频: {audio_url[:50]}...",
+                        task_name=f"单个音频: {audio_url}",
                         audio_urls=[audio_url]
                     )
                     
@@ -602,6 +965,9 @@ with tab2:
                             
                         except Exception as e:
                             st.error(f"❌ 获取任务状态失败: {str(e)}")
+                            # 记录详细错误到后端日志
+                            from logger import business_logger
+                            business_logger.log_error('app', 'get_task_status', e, task_id=task_id)
                             break
                     
                     if wait_count >= max_wait:
@@ -638,8 +1004,10 @@ with tab2:
                 
                 except Exception as e:
                     st.error(f"❌ 分析失败: {str(e)}")
+                    # 记录详细错误到后端日志
                     import traceback
-                    st.error(traceback.format_exc())
+                    from logger import business_logger
+                    business_logger.log_error('app', 'single_audio_analysis', e)
 
         finally:
             # 清理请求记录
@@ -705,8 +1073,10 @@ with tab3:
                     
                     except Exception as e:
                         st.error(f"❌ 启动失败: {str(e)}")
+                        # 记录详细错误到后端日志
                         import traceback
-                        st.error(traceback.format_exc())
+                        from logger import business_logger
+                        business_logger.log_error('app', 'batch_process_start', e)
             
             finally:
                 # 清理请求记录
@@ -714,94 +1084,9 @@ with tab3:
                     st.session_state.submitted_requests.discard(request_key)
 
 
-# ==================== Tab 4: 统计报表 ====================
+# ==================== Tab 4: 系统配置 ====================
 
 with tab4:
-    st.header("📈 统计报表")
-    
-    # 选择任务
-    try:
-        tasks_response = api_client.list_tasks(status='completed', limit=50)
-        tasks = tasks_response.get('tasks', [])
-    except Exception as e:
-        st.error(f"❌ 获取任务列表失败: {str(e)}")
-        tasks = []
-    
-    if tasks:
-        task_options = {t['task_id']: t['task_name'] for t in tasks}
-        selected_task_id = st.selectbox(
-            "选择任务",
-            options=list(task_options.keys()),
-            format_func=lambda x: task_options[x]
-        )
-        
-        if selected_task_id:
-            # 生成报表
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if st.button("生成汇总报表"):
-                    with st.spinner("生成中..."):
-                        try:
-                            report = api_client.get_task_summary(selected_task_id)
-                            st.json(report)
-                        except Exception as e:
-                            st.error(f" 生成报表失败: {str(e)}")
-            
-            with col2:
-                if st.button("生成情绪报表"):
-                    with st.spinner("生成中..."):
-                        try:
-                            report = api_client.get_emotion_report(selected_task_id)
-                            
-                            # 可视化情绪分布
-                            if 'emotion_distribution' in report:
-                                emotions = report['emotion_distribution']
-                                
-                                if emotions:
-                                    df_emotion = pd.DataFrame([
-                                        {'情绪': k, '数量': v['count'], '百分比': v['percentage']}
-                                        for k, v in emotions.items()
-                                    ])
-                                    
-                                    fig = px.pie(
-                                        df_emotion,
-                                        values='数量',
-                                        names='情绪',
-                                        title='情绪分布'
-                                    )
-                                    st.plotly_chart(fig, use_container_width=True)
-                        except Exception as e:
-                            st.error(f"❌ 生成报表失败: {str(e)}")
-            
-            # 性能报表
-            if st.button("生成性能报表"):
-                with st.spinner("生成中..."):
-                    try:
-                        report = api_client.get_performance_report(selected_task_id)
-                        
-                        if 'processing_time_stats' in report:
-                            stats = report['processing_time_stats']
-                            
-                            fig = go.Figure()
-                            fig.add_trace(go.Bar(
-                                x=['最小值', '平均值', '最大值', 'P90', 'P95'],
-                                y=[stats['min'], stats['avg'], stats['max'], stats['p90'], stats['p95']],
-                                name='处理时间（秒）'
-                            ))
-                            
-                            fig.update_layout(title='处理时间统计')
-                            st.plotly_chart(fig, use_container_width=True)
-                    except Exception as e:
-                        st.error(f"❌ 生成报表失败: {str(e)}")
-    
-    else:
-        st.info("暂无已完成的任务")
-
-
-# ==================== Tab 5: 系统配置 ====================
-
-with tab5:
     st.header(" 系统配置管理")
     
     # 配置分类选择
@@ -814,10 +1099,13 @@ with tab5:
     # 查询配置
     try:
         category_filter = None if category == "全部" else category
-        configs_response = api_client.list_configs(category_filter)
+        configs_response = fetch_configs_cached(st.session_state.get('session_token'), category_filter)
         configs = configs_response.get('configs', [])
     except Exception as e:
         st.error(f"❌ 获取配置失败: {str(e)}")
+        # 记录详细错误到后端日志
+        from logger import business_logger
+        business_logger.log_error('app', 'list_configs', e, category=category)
         configs = []
     
     if configs:
@@ -877,10 +1165,14 @@ with tab5:
                                 value=str(new_value),
                                 config_type=config_type
                             )
+                            fetch_configs_cached.clear()
                             st.success(f" 配置 {config_key} 已更新")
                             st.rerun()
                         except Exception as e:
                             st.error(f"❌ 更新失败: {str(e)}")
+                            # 记录详细错误到后端日志
+                            from logger import business_logger
+                            business_logger.log_error('app', 'update_config', e, config_key=config_key, value=value)
                 else:
                     st.text_input("值", value=current_value, disabled=True, key=f"config_{config_key}")
                     st.caption(" 此配置不可编辑")
@@ -894,26 +1186,153 @@ with tab5:
     st.caption("💡 提示: 修改配置后，部分配置可能需要重启应用才能生效")
     
     # 用户管理（仅管理员可见）
-    if is_admin():
+    if st.session_state.get('user_role') == 'admin':
         st.markdown("---")
         st.subheader(" 用户管理")
         
-        # 显示用户列表
+        # 用户查询
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            user_search = st.text_input("🔍 搜索用户", placeholder="输入用户名或邮箱", key="user_search")
+        with col2:
+            role_filter = st.selectbox("角色筛选", ["全部", "admin", "user"], key="role_filter")
+        
+        # 获取用户列表
+        users = []
         try:
-            users_response = api_client.list_users()
+            users_response = fetch_users_cached(st.session_state.get('session_token'))
             users = users_response.get('users', [])
+            
+            # 应用筛选
+            if user_search:
+                users = [u for u in users if user_search.lower() in u.get('username', '').lower() or user_search.lower() in u.get('email', '').lower()]
+            if role_filter != "全部":
+                users = [u for u in users if u.get('role') == role_filter]
             
             if users:
                 df_users = pd.DataFrame(users)
+                # 添加激活状态列的中文显示
+                df_users['激活状态'] = df_users['is_active'].apply(lambda x: '✅ 已激活' if x else '❌ 未激活')
                 st.dataframe(
-                    df_users[['username', 'role', 'email', 'is_active', 'created_at']],
+                    df_users[['username', 'role', 'email', '激活状态', 'created_at']],
                     use_container_width=True,
                     hide_index=True
                 )
+                
+                # 用户激活管理
+                st.markdown("### 🔐 用户激活管理")
+                for user in users:
+                    col1, col2, col3 = st.columns([3, 2, 2])
+                    with col1:
+                        st.write(f"**{user['username']}** ({user['role']})")
+                    with col2:
+                        current_status = "已激活" if user['is_active'] else "未激活"
+                        st.write(f"当前状态: {current_status}")
+                    with col3:
+                        if user['role'] != 'admin':  # 不允许禁用admin用户
+                            if user['is_active']:
+                                if st.button(f"禁用 {user['username']}", key=f"disable_{user['username']}"):
+                                    try:
+                                        api_client.set_user_active(user['username'], False)
+                                        st.success(f"已禁用用户 {user['username']}")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"禁用失败: {str(e)}")
+                            else:
+                                if st.button(f"启用 {user['username']}", key=f"enable_{user['username']}"):
+                                    try:
+                                        api_client.set_user_active(user['username'], True)
+                                        st.success(f"已启用用户 {user['username']}")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"启用失败: {str(e)}")
+                    st.markdown("---")
             else:
                 st.info("暂无用户数据")
         except Exception as e:
             st.error(f"❌ 获取用户列表失败: {str(e)}")
+            # 记录详细错误到后端日志
+            from logger import business_logger
+            business_logger.log_error('app', 'list_users', e)
+        
+        st.markdown("---")
+        
+        # 新增用户
+        with st.expander("➕ 新增用户", expanded=False):
+            with st.form("add_user_form"):
+                new_username = st.text_input("用户名", key="new_username")
+                new_password = st.text_input("密码", type="password", key="new_password")
+                new_role = st.selectbox("角色", ["user", "admin"], key="new_role")
+                new_email = st.text_input("邮箱（可选）", key="new_email")
+                
+                if st.form_submit_button("创建用户", type="primary"):
+                    if not new_username or not new_password:
+                        st.error("请输入用户名和密码")
+                    else:
+                        try:
+                            api_client.create_user(
+                                username=new_username,
+                                password=new_password,
+                                role=new_role,
+                                email=new_email
+                            )
+                            fetch_users_cached.clear()
+                            st.success(f"✅ 用户 {new_username} 创建成功")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ 创建用户失败: {str(e)}")
+                            # 记录详细错误到后端日志
+                            from logger import business_logger
+                            business_logger.log_error('app', 'create_user', e, username=new_username)
+        
+        # 修改/删除用户
+        with st.expander("✏️ 修改/删除用户", expanded=False):
+            with st.form("modify_user_form"):
+                if users:
+                    user_options = {u['username']: u for u in users}
+                    target_username = st.selectbox("选择用户", list(user_options.keys()), key="target_username")
+                    
+                    if target_username:
+                        user_info = user_options[target_username]
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            modify_role = st.selectbox("修改角色", ["user", "admin"], index=["user", "admin"].index(user_info.get('role', 'user')), key="modify_role")
+                        with col2:
+                            modify_active = st.selectbox("状态", ["激活", "注销"], index=0 if user_info.get('is_active') else 1, key="modify_active")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.form_submit_button("保存修改", type="primary"):
+                                try:
+                                    api_client.update_user(
+                                        username=target_username,
+                                        role=modify_role,
+                                        is_active=(modify_active == "激活")
+                                    )
+                                    fetch_users_cached.clear()
+                                    st.success(f"✅ 用户 {target_username} 修改成功")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ 修改失败: {str(e)}")
+                                    # 记录详细错误到后端日志
+                                    from logger import business_logger
+                                    business_logger.log_error('app', 'update_user', e, username=target_username)
+                        
+                        with col2:
+                            if st.form_submit_button("删除用户", type="secondary"):
+                                try:
+                                    api_client.delete_user(target_username)
+                                    fetch_users_cached.clear()
+                                    st.success(f"✅ 用户 {target_username} 已删除")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ 删除失败: {str(e)}")
+                                    # 记录详细错误到后端日志
+                                    from logger import business_logger
+                                    business_logger.log_error('app', 'delete_user', e, username=target_username)
+                else:
+                    st.info("暂无用户可供修改")
 
 # ==================== 页脚 ====================
 

@@ -16,6 +16,12 @@ from config import config
 
 Base = declarative_base()
 
+CUSTOMER_CODE_KEYWORDS = [
+    "客户编码", "客户编号", "customer", "customer_id", "客户id", "客户ID",
+    "手机号", "手机", "mobile", "phone", "联系电话", "电话",
+    "身份证", "身份证号", "证件号", "id_number"
+]
+
 
 # ==================== ORM 模型定义 ====================
 
@@ -25,7 +31,7 @@ class BatchTask(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     task_id = Column(String(64), unique=True, nullable=False, index=True)
-    task_name = Column(String(255), nullable=False)
+    task_name = Column(Text, nullable=False)
     status = Column(Enum('pending', 'running', 'paused', 'completed', 'failed', 'cancelled'), 
                    default='pending', index=True)
     total_count = Column(Integer, default=0)
@@ -35,6 +41,7 @@ class BatchTask(Base):
     progress = Column(Float, default=0.0)
     config_json = Column(Text)
     error_message = Column(Text)
+    user_id = Column(String(64), index=True)  # 用户编号维度
     created_at = Column(DateTime, default=datetime.now)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
@@ -52,6 +59,7 @@ class BatchTask(Base):
             'progress': self.progress,
             'config': json.loads(self.config_json) if self.config_json else {},
             'error_message': self.error_message,
+            'user_id': self.user_id,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'started_at': self.started_at.isoformat() if self.started_at else None,
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,
@@ -91,6 +99,7 @@ class AudioResult(Base):
     
     # 元数据
     extra_data = Column(JSON)
+    customer_no = Column(String(256))  # 客户编号
     origin_data_json = Column(JSON)  # 原始输入数据（单个音频：URL；Excel导入：原始JSON）
     error_message = Column(Text)
     
@@ -110,8 +119,13 @@ class AudioResult(Base):
             'dialogue_summary': self.dialogue_summary,
             'has_abusive_language': self.has_abusive_language,
             'abusive_words': json.loads(self.abusive_words_json) if self.abusive_words_json else [],
+            'participants': json.loads(self.participants_json) if self.participants_json else [],
+            'interaction': json.loads(self.interaction_json) if self.interaction_json else {},
+            'segments': json.loads(self.segments_json) if self.segments_json else [],
             'processing_time': self.processing_time,
+            'customer_no': self.customer_no,
             'origin_data': json.loads(self.origin_data_json) if self.origin_data_json else None,
+            'extra_data': json.loads(self.extra_data) if self.extra_data else {},
             'error_message': self.error_message,
         }
 
@@ -187,7 +201,7 @@ class User(Base):
     salt = Column(String(128), nullable=False)
     role = Column(String(32), default='user')
     email = Column(String(128))
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=False)  # 默认未激活，需要admin启用
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -240,14 +254,15 @@ class DatabaseManager:
     
     # ==================== 任务管理 ====================
     
-    def create_task(self, task_id: str, task_name: str, total_count: int, config_dict: dict = None) -> str:
+    def create_task(self, task_id: str, task_name: str, total_count: int, config_dict: dict = None, user_id: str = None) -> str:
         """创建批处理任务"""
         with self.get_session() as session:
             task = BatchTask(
                 task_id=task_id,
                 task_name=task_name,
                 total_count=total_count,
-                config_json=json.dumps(config_dict or {}, ensure_ascii=False)
+                config_json=json.dumps(config_dict or {}, ensure_ascii=False),
+                user_id=user_id
             )
             session.add(task)
             return task_id
@@ -282,20 +297,155 @@ class DatabaseManager:
             task = session.query(BatchTask).filter_by(task_id=task_id).first()
             return task.to_dict() if task else None
     
-    def list_tasks(self, status: str = None, limit: int = 50) -> List[Dict]:
-        """查询任务列表"""
+    def list_tasks(self, status: str = None, limit: int = 50, customer_no: str = None, task_name: str = None, user_id: str = None, is_admin: bool = False, current_username: str = None) -> List[Dict]:
+        """查询任务列表
+        
+        Args:
+            status: 任务状态过滤
+            limit: 返回数量限制
+            customer_no: 客户编码过滤
+            task_name: 任务名称过滤
+            user_id: 用户编号过滤（仅admin可指定）
+            is_admin: 当前用户是否为管理员
+            current_username: 当前用户名（用于非admin用户自动过滤）
+        """
         with self.get_session() as session:
+            # 基础查询
             query = session.query(BatchTask)
+            
+            # 用户权限控制
+            if not is_admin and current_username:
+                # 非admin用户只能查询自己的任务
+                query = query.filter(BatchTask.user_id == current_username)
+            elif is_admin and user_id:
+                # admin用户可以按用户编号（用户名）查询
+                query = query.filter(BatchTask.user_id == user_id)
+            
+            # 如果指定了客户编码，使用子查询按audio_result.customer_no进行过滤
+            if customer_no:
+                # 子查询：找出所有匹配客户编码的task_id
+                subquery = session.query(AudioResult.task_id).filter(
+                    AudioResult.customer_no.like(f"%{customer_no}%")
+                ).distinct().subquery()
+                
+                # 主查询：只返回匹配的task_id
+                query = query.filter(BatchTask.task_id.in_(subquery))
+            
+            # 如果指定了任务名称，按BatchTask.task_name过滤
+            if task_name:
+                query = query.filter(BatchTask.task_name.like(f"%{task_name}%"))
+                
             if status:
-                query = query.filter_by(status=status)
+                query = query.filter(BatchTask.status == status)
+                
             tasks = query.order_by(BatchTask.created_at.desc()).limit(limit).all()
-            return [task.to_dict() for task in tasks]
+
+            task_dicts: List[Dict] = []
+            for task in tasks:
+                task_dict = task.to_dict()
+                config = task_dict.get('config') or {}
+                primary_code = config.get('primary_customer_code')
+                config_changed = False
+
+                if not primary_code:
+                    # 客户编码取值逻辑为 audio_result.customer_no
+                    audio_result = session.query(AudioResult) \
+                        .filter_by(task_id=task.task_id) \
+                        .order_by(AudioResult.created_at.asc()) \
+                        .first()
+
+                    if audio_result and audio_result.customer_no:
+                        inferred_code = audio_result.customer_no
+
+                        if config.get('primary_customer_code') != inferred_code:
+                            config['primary_customer_code'] = inferred_code
+                            config_changed = True
+
+                        customer_codes = config.get('customer_codes') or []
+                        if not isinstance(customer_codes, list):
+                            customer_codes = [customer_codes]
+                            config_changed = True
+                        if inferred_code not in customer_codes:
+                            customer_codes.insert(0, inferred_code)
+                            config_changed = True
+                        config['customer_codes'] = customer_codes
+
+                if config_changed:
+                    task.config_json = json.dumps(config, ensure_ascii=False)
+                    task_dict['config'] = config
+                else:
+                    task_dict['config'] = config
+
+                task_dicts.append(task_dict)
+
+            return task_dicts
+    
+    def cleanup_completed_files(self, days_old: int = 7) -> int:
+        """清理已完成任务的源文件
+        
+        Args:
+            days_old: 清理多少天前的文件（默认7天）
+        
+        Returns:
+            int: 清理的文件数量
+        """
+        import os
+        from datetime import datetime, timedelta
+        from config import config
+        
+        cutoff_date = datetime.now() - timedelta(days=days_old)
+        cleaned_count = 0
+        
+        with self.get_session() as session:
+            # 查询已完成且超过指定天数的任务
+            completed_tasks = session.query(BatchTask).filter(
+                BatchTask.status == 'completed',
+                BatchTask.completed_at < cutoff_date
+            ).all()
+            
+            for task in completed_tasks:
+                try:
+                    config = json.loads(task.config_json) if task.config_json else {}
+                    source_file_path = config.get('source_file_path')
+                    
+                    if source_file_path and os.path.exists(source_file_path):
+                        os.remove(source_file_path)
+                        cleaned_count += 1
+                        
+                        # 记录清理日志
+                        self.log_business_action(
+                            'INFO', 'file_cleanup', 'delete_file',
+                            f'清理已完成任务文件: {source_file_path}',
+                            task_id=task.task_id
+                        )
+                        
+                        # 更新任务配置，标记文件已清理
+                        config['source_file_cleaned'] = True
+                        config['source_file_cleaned_at'] = datetime.now().isoformat()
+                        task.config_json = json.dumps(config, ensure_ascii=False)
+                        
+                except Exception as e:
+                    # 记录清理失败日志
+                    self.log_business_action(
+                        'ERROR', 'file_cleanup', 'delete_file_failed',
+                        f'清理文件失败: {source_file_path}, 错误: {str(e)}',
+                        task_id=task.task_id
+                    )
+        
+        return cleaned_count
     
     # ==================== 音频结果管理 ====================
     
     def save_audio_result(self, result_dict: dict):
         """保存音频处理结果"""
+        status = result_dict.get('status', 'success')
+        if status != 'success':
+            return
         with self.get_session() as session:
+            # 客户编码取值逻辑为 audio_result.customer_no，不从 payload 中提取
+            # 如果 result_dict 中有 customer_no，直接使用；否则为 None
+            inferred_code = result_dict.get('customer_no')
+
             audio_result = AudioResult(
                 task_id=result_dict['task_id'],
                 audio_id=result_dict['audio_id'],
@@ -317,10 +467,33 @@ class DatabaseManager:
                 llm_time=result_dict.get('llm_time'),
                 realtime_factor=result_dict.get('realtime_factor'),
                 extra_data=json.dumps(result_dict.get('extra_data', {}), ensure_ascii=False) if result_dict.get('extra_data') else None,
+                customer_no=inferred_code,
                 origin_data_json=json.dumps(result_dict.get('origin_data'), ensure_ascii=False) if result_dict.get('origin_data') else None,
                 error_message=result_dict.get('error_message')
             )
             session.add(audio_result)
+
+            if inferred_code:
+                task = session.query(BatchTask).filter_by(task_id=result_dict['task_id']).first()
+                if task:
+                    config = json.loads(task.config_json) if task.config_json else {}
+                    config_changed = False
+
+                    if not config.get('primary_customer_code'):
+                        config['primary_customer_code'] = inferred_code
+                        config_changed = True
+
+                    customer_codes = config.get('customer_codes') or []
+                    if not isinstance(customer_codes, list):
+                        customer_codes = [customer_codes]
+                        config_changed = True
+                    if inferred_code not in customer_codes:
+                        customer_codes.insert(0, inferred_code)
+                        config_changed = True
+                    config['customer_codes'] = customer_codes
+
+                    if config_changed:
+                        task.config_json = json.dumps(config, ensure_ascii=False)
     
     def get_audio_result(self, audio_id: str) -> Optional[Dict]:
         """查询音频结果"""
@@ -358,6 +531,13 @@ class DatabaseManager:
     def log_business_action(self, level: str, module: str, action: str, message: str, 
                            task_id: str = None, audio_id: str = None, **kwargs):
         """记录业务日志"""
+        # 过滤有效的字段
+        valid_fields = {
+            'user_id', 'ip_address', 'request_data', 'response_data', 
+            'execution_time', 'stack_trace'
+        }
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+        
         with self.get_session() as session:
             log = BusinessLog(
                 log_level=level,
@@ -366,7 +546,7 @@ class DatabaseManager:
                 message=message,
                 task_id=task_id,
                 audio_id=audio_id,
-                **kwargs
+                **filtered_kwargs
             )
             session.add(log)
     
@@ -539,7 +719,7 @@ class DatabaseManager:
     # ==================== 用户管理 ====================
     
     def create_user(self, username: str, password_hash: str, salt: str, 
-                    role: str = 'user', email: str = None) -> bool:
+                    role: str = 'user', email: str = None, is_active: bool = False) -> bool:
         """创建用户"""
         try:
             with self.get_session() as session:
@@ -548,7 +728,8 @@ class DatabaseManager:
                     password_hash=password_hash,
                     salt=salt,
                     role=role,
-                    email=email
+                    email=email,
+                    is_active=is_active  # 默认未激活，需要admin启用
                 )
                 session.add(user)
             return True
@@ -584,6 +765,19 @@ class DatabaseManager:
                 'is_active': u.is_active,
                 'created_at': u.created_at.isoformat() if u.created_at else None
             } for u in users]
+    
+    def set_user_active(self, username: str, is_active: bool) -> bool:
+        """设置用户激活状态"""
+        try:
+            with self.get_session() as session:
+                user = session.query(User).filter_by(username=username).first()
+                if user:
+                    user.is_active = is_active
+                    return True
+            return False
+        except Exception as e:
+            print(f"❌ 设置用户激活状态失败: {e}")
+            return False
     
     def update_user_role(self, username: str, new_role: str) -> bool:
         """更新用户角色"""

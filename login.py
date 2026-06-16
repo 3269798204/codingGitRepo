@@ -66,24 +66,73 @@ def show_login_page():
     """显示登录页面"""
     st.markdown("""
         <style>
+        body {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            min-height: 100vh;
+        }
         .login-container {
-            max-width: 400px;
-            margin: 100px auto;
+            max-width: 480px;
+            margin: 60px auto;
             padding: 40px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+            background: rgba(255, 255, 255, 0.98);
+            backdrop-filter: blur(10px);
+        }
+        @media (max-width: 768px) {
+            .login-container {
+                margin: 20px auto;
+                padding: 25px;
+                max-width: 90%;
+            }
+        }
+        .login-title {
+            color: #1e3c72;
+            font-size: 28px;
+            font-weight: 600;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .login-subtitle {
+            color: #666;
+            font-size: 14px;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .stButton > button {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 12px 24px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        .stButton > button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(30, 60, 114, 0.3);
+        }
+        .stTextInput > div > div > input {
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            padding: 12px;
+        }
+        .stTextInput > div > div > input:focus {
+            border-color: #1e3c72;
+            box-shadow: 0 0 0 3px rgba(30, 60, 114, 0.1);
         }
         </style>
     """, unsafe_allow_html=True)
     
     st.markdown('<div class="login-container">', unsafe_allow_html=True)
-    st.title("🔐 用户登录")
-    st.markdown("---")
+    st.markdown('<h1 class="login-title">🔐 语音识别分析系统</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="login-subtitle">专业的语音识别与对话分析平台</p>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
     
     # 登录表单
     with st.form("login_form"):
-        username = st.text_input("👤 用户名", placeholder="请输入用户名")
-        password = st.text_input("🔑 密码", type="password", placeholder="请输入密码")
+        username = st.text_input("👤 用户名", placeholder="请输入用户名", help="输入您的用户名")
+        password = st.text_input("🔑 密码", type="password", placeholder="请输入密码", help="输入您的密码")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -125,7 +174,13 @@ def show_login_page():
                         st.success("✅ 登录成功！")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"❌ 登录失败: {str(e)}")
+                        error_msg = str(e)
+                        if "用户名或密码错误" in error_msg:
+                            st.error("❌ 用户名或密码错误")
+                        elif "未激活" in error_msg or "inactive" in error_msg.lower():
+                            st.error("❌ 账号未激活，请联系管理员激活后登录")
+                        else:
+                            st.error(f"❌ 登录失败: {error_msg}")
         
         if register_button:
             st.session_state['show_register'] = True
@@ -134,12 +189,12 @@ def show_login_page():
     # 注册表单
     if st.session_state.get('show_register', False):
         st.markdown("---")
-        st.subheader("📝 新用户注册")
+        st.markdown('<h2 style="color: #1e3c72; font-size: 20px;">📝 新用户注册</h2>', unsafe_allow_html=True)
         
         with st.form("register_form"):
-            reg_username = st.text_input("👤 用户名", key="reg_username")
-            reg_password = st.text_input("🔑 密码", type="password", key="reg_password")
-            reg_confirm_password = st.text_input("🔑 确认密码", type="password", key="reg_confirm")
+            reg_username = st.text_input("👤 用户名", key="reg_username", placeholder="设置用户名")
+            reg_password = st.text_input("🔑 密码", type="password", key="reg_password", placeholder="设置密码")
+            reg_confirm_password = st.text_input("🔑 确认密码", type="password", key="reg_confirm", placeholder="再次输入密码")
             
             col1, col2 = st.columns(2)
             with col1:
@@ -228,6 +283,18 @@ def show_logout_button():
         
         # 清除localStorage
         clear_auth_from_localstorage()
+
+        # 清除URL查询参数，避免刷新后自动恢复
+        try:
+            st.query_params.clear()
+        except AttributeError:
+            try:
+                st.experimental_set_query_params()
+            except Exception:
+                try:
+                    st.query_params = {}
+                except Exception:
+                    pass
         
         # 清除session_state
         st.session_state['logged_in'] = False

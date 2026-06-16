@@ -1,6 +1,6 @@
 """
 临时兼容层 - 用于前后端分离过渡期
-提供db_manager, report_gen等对象的API调用包装
+提供 db_manager 的 API 调用包装
 """
 
 from api_client import APIClient
@@ -15,9 +15,9 @@ class DatabaseManagerCompat:
     def __init__(self):
         self.api = _api_client
     
-    def list_tasks(self, status=None, limit=50):
+    def list_tasks(self, status=None, limit=50, customer_no=None, task_name=None, user_id=None, is_admin=False, current_username=None):
         """获取任务列表"""
-        response = self.api.list_tasks(status=status, limit=limit)
+        response = self.api.list_tasks(status=status, limit=limit, customer_no=customer_no, task_name=task_name, user_id=user_id, is_admin=is_admin, current_username=current_username)
         return response.get('tasks', [])
     
     def get_task(self, task_id):
@@ -37,25 +37,5 @@ class DatabaseManagerCompat:
         return task
 
 
-class ReportGeneratorCompat:
-    """报表生成器兼容层 - 通过API调用"""
-    
-    def __init__(self):
-        self.api = _api_client
-    
-    def generate_task_summary(self, task_id):
-        """生成任务汇总报表"""
-        return self.api.get_task_summary(task_id)
-    
-    def generate_emotion_report(self, task_id):
-        """生成情绪分布报表"""
-        return self.api.get_emotion_report(task_id)
-    
-    def generate_performance_report(self, task_id):
-        """生成性能监控报表"""
-        return self.api.get_performance_report(task_id)
-
-
 # 创建兼容实例（用于过渡期）
 db_manager = DatabaseManagerCompat()
-report_gen = ReportGeneratorCompat()

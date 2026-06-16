@@ -85,6 +85,10 @@ class AuthManager:
             if not user:
                 return None
             
+            # 检查用户是否激活
+            if not user.get('is_active', False):
+                return None
+            
             # 验证密码
             hashed_password, _ = self.hash_password(password, user['salt'])
             if hashed_password != user['password_hash']:

@@ -4,18 +4,22 @@ FastAPI 后端 API
 """
 
 import os
+import time
 import uuid
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Header, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import config
 from database import db_manager
 from batch_processor import BatchProcessor
 from csv_parser import CSVParser
-from report_generator import ReportGenerator
 from logger import business_logger
+from logger_config import get_app_logger, get_error_logger
+from exception_handler import install_global_exception_handler
 from auth import auth_manager
 
 
@@ -41,7 +45,81 @@ app = FastAPI(
     version="3.0.0"
 )
 
+# 全局异常处理与日志
+install_global_exception_handler()
+app_logger = get_app_logger()
+error_logger = get_error_logger()
+
+# 定时清理任务调度器
+scheduler = BackgroundScheduler()
+
+def scheduled_file_cleanup():
+    """定时清理已完成任务的源文件"""
+    try:
+        cleaned_count = db_manager.cleanup_completed_files(days_old=7)
+        business_logger.log_info("scheduler", "file_cleanup", f"定时清理了 {cleaned_count} 个文件")
+    except Exception as e:
+        business_logger.log_error("scheduler", "file_cleanup", e)
+
+# 每天凌晨2点执行文件清理
+scheduler.add_job(scheduled_file_cleanup, 'cron', hour=2, minute=0)
+scheduler.start()
+
 # CORS 配置
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """记录所有HTTP请求的info日志，error时输出堆栈"""
+    start_time = time.perf_counter()
+    request_id = str(uuid.uuid4())
+
+    app_logger.info(
+        "➡️ 请求开始",
+        extra={
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "client": request.client.host if request.client else None,
+        },
+    )
+
+    try:
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        app_logger.info(
+            "✅ 请求完成",
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": round(duration_ms, 2),
+            },
+        )
+        return response
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        error_logger.error(
+            "❌ 请求异常",
+            exc_info=exc,
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": round(duration_ms, 2),
+            },
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "message": "服务器内部错误，请稍后重试",
+                "request_id": request_id,
+            },
+        )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,10 +128,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # 初始化组件
 batch_processor = BatchProcessor()
 csv_parser = CSVParser()
-report_gen = ReportGenerator()
 
 
 # ==================== 认证 API ====================
@@ -64,6 +142,12 @@ class LoginRequest(BaseModel):
     """登录请求模型"""
     username: str
     password: str
+
+
+class UserActiveRequest(BaseModel):
+    """用户激活状态请求模型"""
+    username: str
+    is_active: bool
 
 
 @app.post("/api/auth/login")
@@ -90,24 +174,44 @@ async def verify_token(authorization: Optional[str] = Header(None)):
     token = authorization.replace("Bearer ", "")
     user_info = auth_manager.verify_session(token)
     if not user_info:
-        raise HTTPException(status_code=401, detail="token无效或已过期")
+        raise HTTPException(status_code=401, detail="无效token")
     
     return user_info
+
+
+@app.post("/api/admin/users/activate")
+def set_user_active(request: UserActiveRequest):
+    """设置用户激活状态（仅admin）"""
+    success = db_manager.set_user_active(request.username, request.is_active)
+    if success:
+        business_logger.log_info("api", "set_user_active", f"设置用户 {request.username} 激活状态为 {request.is_active}")
+        return {"success": True, "message": "用户激活状态已更新"}
+    else:
+        raise HTTPException(status_code=404, detail="用户不存在")
 
 
 # ==================== 任务管理 API ====================
 
 @app.post("/api/tasks")
-def create_task(request: TaskCreateRequest):
+def create_task(request: TaskCreateRequest, authorization: Optional[str] = Header(None)):
     """创建批处理任务"""
     try:
+        # 从token中提取用户信息
+        user_id = None
+        if authorization:
+            token = authorization.replace("Bearer ", "")
+            user_info = auth_manager.verify_session(token)
+            if user_info:
+                user_id = user_info.get('username')
+        
         task_id = batch_processor.start_batch(
             task_name=request.task_name,
             audio_urls=request.audio_urls,
-            extra_data_list=request.extra_data
+            extra_data_list=request.extra_data,
+            user_id=user_id
         )
         
-        business_logger.log_info("api", "create_task", f"任务创建成功: {task_id}")
+        business_logger.log_info("api", "create_task", f"任务创建成功: {task_id}, 用户: {user_id}")
         
         return {
             "success": True,
@@ -132,9 +236,9 @@ def get_task(task_id: str):
 
 
 @app.get("/api/tasks")
-def list_tasks(status: Optional[str] = None, limit: int = 50):
+def list_tasks(status: Optional[str] = None, limit: int = 50, customer_no: Optional[str] = None, task_name: Optional[str] = None, user_id: Optional[str] = None, is_admin: Optional[bool] = False, current_username: Optional[str] = None):
     """查询任务列表"""
-    tasks = db_manager.list_tasks(status=status, limit=limit)
+    tasks = db_manager.list_tasks(status=status, limit=limit, customer_no=customer_no, task_name=task_name, user_id=user_id, is_admin=is_admin, current_username=current_username)
     return {"tasks": tasks}
 
 
@@ -148,6 +252,25 @@ def pause_task(task_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/tasks/{task_id}/continue")
+def continue_task(task_id: str):
+    """继续执行未完成的任务"""
+    try:
+        task_id = batch_processor.continue_task(task_id)
+        business_logger.log_info("api", "continue_task", f"任务继续执行: {task_id}")
+        return {
+            "success": True,
+            "task_id": task_id,
+            "message": "任务已继续执行"
+        }
+    except ValueError as e:
+        business_logger.log_error("api", "continue_task", e)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        business_logger.log_error("api", "continue_task", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/tasks/{task_id}/resume")
 def resume_task(task_id: str, background_tasks: BackgroundTasks):
     """恢复任务"""
@@ -155,6 +278,22 @@ def resume_task(task_id: str, background_tasks: BackgroundTasks):
         # TODO: 实现恢复逻辑
         return {"success": True, "message": "任务恢复中"}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/cleanup-files")
+def cleanup_files(days_old: int = 7):
+    """清理已完成任务的源文件"""
+    try:
+        cleaned_count = db_manager.cleanup_completed_files(days_old=days_old)
+        business_logger.log_info("api", "cleanup_files", f"清理了 {cleaned_count} 个文件")
+        return {
+            "success": True,
+            "cleaned_count": cleaned_count,
+            "message": f"成功清理 {cleaned_count} 个文件"
+        }
+    except Exception as e:
+        business_logger.log_error("api", "cleanup_files", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -198,9 +337,19 @@ async def upload_file(file: UploadFile = File(...)):
 
 
 @app.post("/api/upload/process")
-async def upload_and_process(file: UploadFile = File(...), task_name: str = "批量任务"):
+async def upload_and_process(file: UploadFile = File(...), task_name: str = Form("批量任务")):
     """上传并立即开始批处理"""
     try:
+        # 验证文件
+        if not file.filename:
+            raise ValueError("未选择文件")
+        
+        # 检查文件扩展名
+        allowed_extensions = ['.csv', '.xlsx', '.xls']
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in allowed_extensions:
+            raise ValueError(f"不支持的文件格式: {file_ext}，仅支持 CSV、Excel 文件")
+        
         # 保存文件
         upload_dir = config.upload_dir
         os.makedirs(upload_dir, exist_ok=True)
@@ -211,8 +360,15 @@ async def upload_and_process(file: UploadFile = File(...), task_name: str = "批
             content = await file.read()
             f.write(content)
         
+        # 验证文件大小
+        if os.path.getsize(file_path) == 0:
+            raise ValueError("文件为空")
+        
         # 提取音频列表
-        audio_list = csv_parser.extract_audio_list(file_path)
+        try:
+            audio_list = csv_parser.extract_audio_list(file_path)
+        except Exception as e:
+            raise ValueError(f"文件解析失败: {str(e)}")
         
         if not audio_list:
             raise ValueError("未找到有效的音频 URL")
@@ -221,10 +377,20 @@ async def upload_and_process(file: UploadFile = File(...), task_name: str = "批
         urls = [item['url'] for item in audio_list]
         extra_data = [item['extra_data'] for item in audio_list]
         
+        # 任务名称加上原始导入文件名称、本地路径来源
+        formatted_task_name = f"{task_name} (文件: {file.filename}, 路径: {file_path})"
+        
+        # 存储文件路径到任务配置中，用于后续清理
+        task_config = {
+            'source_file_path': file_path,
+            'source_file_name': file.filename
+        }
+        
         task_id = batch_processor.start_batch(
-            task_name=task_name,
+            task_name=formatted_task_name,
             audio_urls=urls,
-            extra_data_list=extra_data
+            extra_data_list=extra_data,
+            task_config=task_config
         )
         
         return {
@@ -233,8 +399,16 @@ async def upload_and_process(file: UploadFile = File(...), task_name: str = "批
             "total_count": len(urls)
         }
     
+    except ValueError as e:
+        # 业务逻辑错误 - 返回422
+        from logger import business_logger
+        business_logger.log_error('api', 'upload_process', e, task_name=task_name, filename=file.filename if file else None)
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # 系统错误 - 返回500
+        from logger import business_logger
+        business_logger.log_error('api', 'upload_process', e, task_name=task_name, filename=file.filename if file else None)
+        raise HTTPException(status_code=500, detail="服务器内部错误")
 
 
 # ==================== 结果查询 API ====================
@@ -255,36 +429,6 @@ def get_task_results(task_id: str, status: Optional[str] = None, limit: int = 10
     """查询任务的所有结果"""
     results = db_manager.get_task_results(task_id, status=status, limit=limit)
     return {"results": results}
-
-
-# ==================== 报表 API ====================
-
-@app.get("/api/reports/task_summary/{task_id}")
-def get_task_summary(task_id: str):
-    """获取任务汇总报表"""
-    report = report_gen.generate_task_summary(task_id)
-    return report
-
-
-@app.get("/api/reports/emotion/{task_id}")
-def get_emotion_report(task_id: str):
-    """获取情绪分布报表"""
-    report = report_gen.generate_emotion_report(task_id)
-    return report
-
-
-@app.get("/api/reports/performance/{task_id}")
-def get_performance_report(task_id: str):
-    """获取性能监控报表"""
-    report = report_gen.generate_performance_report(task_id)
-    return report
-
-
-@app.get("/api/reports/quality/{task_id}")
-def get_quality_report(task_id: str):
-    """获取质量评估报表"""
-    report = report_gen.generate_quality_report(task_id)
-    return report
 
 
 # ==================== 日志 API ====================
